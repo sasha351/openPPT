@@ -25,6 +25,21 @@ The button parses the assistant message it's clicked on:
 
 Prose before the first `#` (e.g. "Here's your deck:") is ignored.
 
+**Speaker notes:** a line starting with `Notes:` (anywhere in a slide, after its heading) becomes that slide's speaker notes.
+
+```markdown
+# Key Wins
+- Launched EU region
+Notes: mention the EU launch timeline if asked
+```
+
+**Images:** a bullet written as `![alt text](url or path)` embeds that image on the slide instead of a text bullet. A slide made up entirely of image bullets keeps its title and drops the bullet list in favor of the image(s); images that fail to load (bad URL, network error) are silently skipped so the export never fails because of one broken link.
+
+```markdown
+# Team Photo
+- ![Team offsite](https://example.com/team.jpg)
+```
+
 ## Recommended: a "Presentation Builder" preset
 
 For the smoothest flow, create a model preset (**Workspace → Models → + New**) based on your model (e.g. Gemma) with this system prompt:
@@ -54,4 +69,4 @@ Chat until the outline looks right, then click **Export to PowerPoint**.
 pip install python-pptx && python test_parser.py
 ```
 
-v1 scope: title + bullet slides on the default template. No custom themes, speaker notes, or images (yet).
+v0.2 scope: title + bullet slides on the default template, plus speaker notes and images. No custom themes (yet).
