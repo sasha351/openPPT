@@ -2,6 +2,8 @@
 
 Let any LLM in [Open WebUI](https://openwebui.com) create PowerPoint decks — including models with **no function calling** (Gemma, etc.). The model just writes a Markdown outline in chat; an **"Export to PowerPoint"** button under the message converts it to a downloadable `.pptx`.
 
+**Dump content + a template → the model fills the slides.** Attach your own `.pptx`/`.potx` to the chat, paste in raw content, and ask for a deck: the model writes the outline and the export inherits your template's theme, fonts, colors, and layouts. See [Templates](#templates-bring-your-own-theme).
+
 ## Install
 
 1. Open WebUI → **Admin Panel → Functions → + New Function**.
@@ -40,6 +42,35 @@ Notes: mention the EU launch timeline if asked
 - ![Team offsite](https://example.com/team.jpg)
 ```
 
+## Templates: bring your own theme
+
+Attach a `.pptx` or `.potx` file to the chat and click **Export to PowerPoint**. Instead of the plain default theme, the deck is built **on your template** — inheriting its slide master, layouts, fonts, and colors. If you attach several, the most recent one wins. Any sample slides in the template are dropped; only its design is kept.
+
+This is the "dump content + a template" flow: give the model a pile of raw content and your branded template, let it write the outline, and the export drops that content into your design.
+
+**Pick a layout per slide.** Name any layout from your template so the model controls the design of each slide — inline on the heading or on its own `Layout:` line:
+
+```markdown
+# Product Roadmap @layout: Section Header
+
+# Q4 Priorities
+Layout: Two Content
+- Ship billing v2
+- Migrate to EU region
+```
+
+Names are matched case-insensitively (exact first, then a loose substring match), so `@layout: two content` finds **Two Content**. If no template is attached, or a name doesn't match, openPPT falls back to sensible defaults (a title-slide layout for the opening slide, a title-and-content layout for the rest) chosen by inspecting each layout's placeholders — so this works with any template, not just PowerPoint's built-in themes.
+
+Not sure what your template offers? `list_layouts()` returns every layout name (and its placeholder counts):
+
+```python
+from openppt_action import list_layouts
+for name, ph in list_layouts(open("brand.potx", "rb").read()):
+    print(name, ph)   # e.g. 'Section Header' {'title': 1, 'subtitle': 0, 'body': 1}
+```
+
+Drop those names into your model's system prompt so it picks layouts that actually exist in your template.
+
 ## Recommended: a "Presentation Builder" preset
 
 For the smoothest flow, create a model preset (**Workspace → Models → + New**) based on your model (e.g. Gemma) with this system prompt:
@@ -59,9 +90,13 @@ respond ONLY with a Markdown outline in exactly this format:
 Rules: start every slide with '# ', use 3-6 bullets per slide, keep
 bullets under 12 words, no prose outside the outline. When the user
 requests changes, reply with the full revised outline.
+
+If the user attaches a template and lists its layout names, choose one per
+slide by adding '@layout: <name>' to the heading (e.g.
+'# Overview @layout: Section Header'). Use only names the user provided.
 ```
 
-Chat until the outline looks right, then click **Export to PowerPoint**.
+Chat until the outline looks right, then click **Export to PowerPoint**. Attach a `.pptx`/`.potx` template to the chat to give the deck your theme.
 
 ## Development
 
@@ -69,4 +104,4 @@ Chat until the outline looks right, then click **Export to PowerPoint**.
 pip install python-pptx && python test_parser.py
 ```
 
-v0.2 scope: title + bullet slides on the default template, plus speaker notes and images. No custom themes (yet).
+v0.3 scope: title + bullet slides, speaker notes, images, **custom `.pptx`/`.potx` templates**, and per-slide layout selection by name. Placeholder mapping is generic (resolved by placeholder type), so it works on any template's layouts.
