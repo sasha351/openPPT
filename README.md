@@ -29,6 +29,8 @@ The Action works on its own (write an outline, click export). Add the Filter and
 
 An "Export to PowerPoint" button now appears under every assistant message, and attaching a template primes the model automatically.
 
+> **No button showing?** Open WebUI only renders Action buttons for models **saved in its database** — models pulled live from Ollama, or reached through a **direct OpenAI-API connection**, don't get them, even with the function enabled globally and no load errors. Fix: **Workspace → Models → ➕**, set the **Base Model** to the model you chat with, save, then use that custom model. The button (and the Template Primer filter) attach to the custom model. This is the most common reason the button never appears.
+
 ## Outline format
 
 The button parses the assistant message it's clicked on:
