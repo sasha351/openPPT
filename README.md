@@ -2,15 +2,32 @@
 
 Let any LLM in [Open WebUI](https://openwebui.com) create PowerPoint decks — including models with **no function calling** (Gemma, etc.). The model just writes a Markdown outline in chat; an **"Export to PowerPoint"** button under the message converts it to a downloadable `.pptx`.
 
-**Dump content + a template → the model fills the slides.** Attach your own `.pptx`/`.potx` to the chat, paste in raw content, and ask for a deck: the model writes the outline and the export inherits your template's theme, fonts, colors, and layouts. See [Templates](#templates-bring-your-own-theme).
+## The workflow: template in, deck out
+
+**Attach a template + dump your content → get a formatted deck.**
+
+1. Attach your own `.pptx`/`.potx` template to the chat.
+2. Paste in the raw content you want the deck to be about (notes, a doc, bullet dumps — anything).
+3. Ask for a presentation.
+
+The model reads your template's layouts, organizes your content into slides that flow logically (title → overview → grouped sections → summary), and writes the outline. Click **Export to PowerPoint** and the deck is built on your template — inheriting its theme, fonts, colors, and layouts.
+
+Two pieces make this work, and you install both:
+
+| Piece | File | What it does |
+|-------|------|--------------|
+| **Filter** | [`openppt_filter.py`](openppt_filter.py) | Runs *before* the model. Detects your attached template, reads its layouts, and primes the model to format your content into a flowing deck that fills those layouts. |
+| **Action** | [`openppt_action.py`](openppt_action.py) | The **Export to PowerPoint** button. Turns the outline into a `.pptx` built on your template. |
+
+The Action works on its own (write an outline, click export). Add the Filter and you get the hands-off "template in, deck out" flow above.
 
 ## Install
 
 1. Open WebUI → **Admin Panel → Functions → + New Function**.
-2. Paste the contents of [`openppt_action.py`](openppt_action.py), save.
-3. Enable the function, and toggle it on for the models you want (or globally). `python-pptx` is installed automatically from the function's `requirements` frontmatter.
+2. Paste the contents of [`openppt_action.py`](openppt_action.py), save. Repeat for [`openppt_filter.py`](openppt_filter.py).
+3. Enable both, and toggle them on for the models you want (or globally). `python-pptx` is installed automatically from each function's `requirements` frontmatter.
 
-An "Export to PowerPoint" button now appears under every assistant message.
+An "Export to PowerPoint" button now appears under every assistant message, and attaching a template primes the model automatically.
 
 ## Outline format
 
@@ -46,9 +63,9 @@ Notes: mention the EU launch timeline if asked
 
 Attach a `.pptx` or `.potx` file to the chat and click **Export to PowerPoint**. Instead of the plain default theme, the deck is built **on your template** — inheriting its slide master, layouts, fonts, and colors. If you attach several, the most recent one wins. Any sample slides in the template are dropped; only its design is kept.
 
-This is the "dump content + a template" flow: give the model a pile of raw content and your branded template, let it write the outline, and the export drops that content into your design.
+With the [Filter](#the-workflow-template-in-deck-out) installed, attaching the template also primes the model automatically: it's told your template's layout names and the outline format, then asked to organize whatever content you provided into a deck that flows. You don't have to describe the format or the layouts yourself — just drop in the template and your content.
 
-**Pick a layout per slide.** Name any layout from your template so the model controls the design of each slide — inline on the heading or on its own `Layout:` line:
+**Pick a layout per slide.** Name any layout from your template so the model controls the design of each slide — inline on the heading or on its own `Layout:` line (the Filter tells the model to do this for you):
 
 ```markdown
 # Product Roadmap @layout: Section Header
@@ -69,11 +86,11 @@ for name, ph in list_layouts(open("brand.potx", "rb").read()):
     print(name, ph)   # e.g. 'Section Header' {'title': 1, 'subtitle': 0, 'body': 1}
 ```
 
-Drop those names into your model's system prompt so it picks layouts that actually exist in your template.
+Drop those names into your model's system prompt so it picks layouts that actually exist in your template. (The Filter does exactly this on your behalf whenever a template is attached, so you rarely need to.)
 
-## Recommended: a "Presentation Builder" preset
+## No template? A "Presentation Builder" preset
 
-For the smoothest flow, create a model preset (**Workspace → Models → + New**) based on your model (e.g. Gemma) with this system prompt:
+The Filter only kicks in when a template is attached. For deck-building **without** a template, create a model preset (**Workspace → Models → + New**) based on your model (e.g. Gemma) with this system prompt:
 
 ```
 You are a presentation builder. When the user asks for a presentation,
@@ -101,7 +118,7 @@ Chat until the outline looks right, then click **Export to PowerPoint**. Attach 
 ## Development
 
 ```
-pip install python-pptx && python test_parser.py
+pip install python-pptx pydantic && python test_parser.py && python test_filter.py
 ```
 
-v0.3 scope: title + bullet slides, speaker notes, images, **custom `.pptx`/`.potx` templates**, and per-slide layout selection by name. Placeholder mapping is generic (resolved by placeholder type), so it works on any template's layouts.
+v0.3 scope: title + bullet slides, speaker notes, images, **custom `.pptx`/`.potx` templates**, per-slide layout selection by name, and a **template primer Filter** that turns "attach a template + dump content" into a formatted deck automatically. Placeholder mapping is generic (resolved by placeholder type), so it works on any template's layouts.
