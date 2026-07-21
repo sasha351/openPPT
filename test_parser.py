@@ -136,6 +136,40 @@ def test_ignores_appended_download_link():
     assert slides == parse_outline(SAMPLE)
 
 
+def test_legacy_pre_0_4_0_appendix_is_not_parsed():
+    """Versions before 0.4.0 appended openPPT's own output with no marker at
+    all, so parse_outline has no APPENDIX_MARKER line to break on. A real
+    v0.3.5 diagnostic looked like this — and used to parse into a slide
+    titled 'openPPT v0.3.5 diagnostic — ...' with its bullets under it."""
+    legacy_diagnostic = (
+        "\n\n---\n**openPPT v0.3.5 diagnostic** — openPPT: nothing "
+        "slide-shaped in that message.\n\n- messages in request: 2\n"
+        "- body id: `abc`\n\nWhat it parsed:\n\n```\n(empty)\n```\n"
+    )
+    assert parse_outline(legacy_diagnostic) == []
+
+    legacy_download = "\n\n📊 [Download deck.pptx](/api/v1/files/x/content)"
+    assert parse_outline(legacy_download) == []
+
+    # The realistic composite case: export succeeded (so the message already
+    # had a real outline) and the user re-clicks, appending the legacy
+    # (marker-less) download link to it. Parses to exactly the same slides.
+    assert parse_outline(SAMPLE + legacy_download) == parse_outline(SAMPLE)
+
+    # A legacy diagnostic never actually lands next to a real outline in
+    # production — it only gets appended when parse_outline found nothing —
+    # but as a parser-robustness check: appending it after a real outline
+    # still creates no extra slide and leaks none of the diagnostic's prose.
+    # One harmless artifact remains: the diagnostic's own leading '---' isn't
+    # part of the break-trigger set (bare '---' is meaningful elsewhere, as a
+    # slide separator in headingless decks — see test_headingless_fallbacks),
+    # so it lands as a literal trailing bullet on the deck's last slide.
+    combined = parse_outline(SAMPLE + legacy_diagnostic)
+    base = parse_outline(SAMPLE)
+    assert [s["title"] for s in combined] == [s["title"] for s in base]
+    assert combined[-1]["bullets"] == base[-1]["bullets"] + [(0, "---")]
+
+
 def test_never_raises():
     for junk in ["", "\x00�🙂" * 100, "#" * 500, "- \n" * 5000, "```\nunclosed"]:
         assert isinstance(parse_outline(junk), list)
@@ -243,7 +277,7 @@ def test_dense_bullet_list_shrinks():
     out = Presentation(io.BytesIO(build_pptx(parse_outline(outline))))
     (body,) = [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
     assert len(body.text_frame.paragraphs) == 14
-    assert body.text_frame.paragraphs[0].font.size.pt <= 14
+    assert all(p.font.size.pt <= 14 for p in body.text_frame.paragraphs)
 
 
 def test_find_layout_by_name_is_fuzzy():
@@ -386,7 +420,9 @@ def test_no_outline_diagnostic_is_not_itself_slide_shaped():
     (message,) = [e for e in events if e["type"] == "message"]
     posted = message["data"]["content"]
     assert APPENDIX_MARKER in posted
-    assert parse_outline(posted) == []
+    # the marker-strip in parse_outline would make this pass for any body at
+    # all — assert on the diagnostic's own prose, after the marker, instead
+    assert parse_outline(posted.split(APPENDIX_MARKER, 1)[1]) == []
     # and once appended to the message, it is invisible to the next click
     appended = {"id": "m1", "role": "assistant", "content": "Sorry, I can't help with that." + posted}
     assert _pick_outline([appended], "m1") == "Sorry, I can't help with that."

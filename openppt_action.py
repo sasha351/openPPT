@@ -122,6 +122,8 @@ def parse_outline(markdown: str) -> list:
     if no slides found. Everything from the `APPENDIX_MARKER` line onward is
     ignored too, so re-exporting a message openPPT already appended to (a
     download link, a diagnostic) doesn't parse that text back into slides.
+    Pre-0.4.0 openPPT versions appended output with no marker at all, so a
+    line starting with '**openPPT v0.3' or '📊 [Download ' also ends parsing.
     """
     lines = markdown.splitlines()
     level_marker = _slide_level(lines)
@@ -137,8 +139,8 @@ def parse_outline(markdown: str) -> list:
 
     for raw in lines:
         line = raw.strip()
-        if line == APPENDIX_MARKER:
-            break  # everything below is openPPT's own appended output
+        if line == APPENDIX_MARKER or line.startswith(("**openPPT v0.3", "\U0001F4CA [Download ")):
+            break  # openPPT's own appended output — pre-0.4.0 versions had no marker
         if not line or line.startswith("```"):
             continue
 
@@ -383,7 +385,10 @@ def _body_size(bullets) -> int:
 
 
 def _fit(text_frame) -> None:
-    """Wrap, and let PowerPoint shrink further than our estimate if it must."""
+    """Wrap, and set autofit so tools that recompute it (LibreOffice, Google
+    Slides) can still shrink text further. PowerPoint itself only recomputes
+    autofit on edit, so on first open our explicit Pt() sizes are what fit
+    the text — this just avoids overflow markers on the placeholder."""
     text_frame.word_wrap = True
     text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
 
@@ -478,6 +483,10 @@ def _pick_outline(messages: list, target=None) -> str:
         # marker is actually present, or an ordinary message's own trailing
         # whitespace would get eaten.
         text = msg.get("content") or ""
+        if not isinstance(text, str):
+            # Open WebUI can hand back list-shaped (multimodal) content; treat
+            # it as no outline rather than raising out of .partition() below.
+            text = ""
         before, marker, _ = text.partition(APPENDIX_MARKER)
         if marker:
             text = before.rstrip()
