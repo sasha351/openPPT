@@ -291,6 +291,11 @@ def test_action_inserts_the_file_and_links_to_it():
         assert inserted[file_id]["meta"]["size"] > 0
         link = f"/api/v1/files/{file_id}/content"
         assert any(link in str(e["data"].get("content", "")) for e in events), events
+        # and it's offered as a real attachment, not only as markdown
+        (attached,) = [e for e in events if e["type"] == "files"]
+        (chip,) = attached["data"]["files"]
+        assert chip["id"] == file_id and chip["url"] == file_id
+        assert chip["type"] == "file" and chip["name"].endswith(".pptx")
         # and the attached .pptx was picked up as the template
         assert "on your template" in descriptions
 

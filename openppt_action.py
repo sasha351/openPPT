@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.3.4
+version: 0.3.5
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -15,6 +15,8 @@ import uuid
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.util import Pt
+
+PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
 IMAGE_RE = re.compile(r"^!\[(.*?)\]\((.*?)\)$")
 NOTES_RE = re.compile(r"^notes?:\s*(.*)$", re.IGNORECASE)
@@ -460,7 +462,7 @@ class Action:
                         "type": "message",
                         "data": {
                             "content": (
-                                f"\n\n---\n**openPPT v0.3.4 diagnostic** — {help_text}\n\n"
+                                f"\n\n---\n**openPPT v0.3.5 diagnostic** — {help_text}\n\n"
                                 f"- messages in request: {len(messages)}\n"
                                 f"- body id: `{target}`\n"
                                 f"- content type: `{type(content).__name__}`, "
@@ -508,11 +510,7 @@ class Action:
                         filename=name,
                         path=file_path,
                         data={},
-                        meta={
-                            "name": name,
-                            "content_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                            "size": len(data),
-                        },
+                        meta={"name": name, "content_type": PPTX_MIME, "size": len(data)},
                     ),
                 )
             )
@@ -521,16 +519,47 @@ class Action:
             if record is None:
                 raise RuntimeError("Open WebUI rejected the file record")
 
+            # Two delivery paths on purpose. The 'files' event is how Open WebUI
+            # returns its own generated files: it lands in the message's files
+            # column and renders as an attachment chip (with a .pptx preview and
+            # a download). The markdown link covers versions whose event handler
+            # ignores 'files'. Emitted separately so one failing can't lose both.
+            url = f"/api/v1/files/{file_id}/content"
+            try:
+                await emit(
+                    {
+                        "type": "files",
+                        "data": {
+                            "files": [
+                                {
+                                    "type": "file",
+                                    "id": file_id,
+                                    "url": file_id,  # FileItem prefixes /api/v1/files/
+                                    "name": name,
+                                    "collection_name": "",
+                                    "status": "uploaded",
+                                    "size": len(data),
+                                    "content_type": PPTX_MIME,
+                                    "meta": {
+                                        "name": name,
+                                        "content_type": PPTX_MIME,
+                                        "size": len(data),
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            except Exception as e:
+                print(f"[openPPT] files event rejected: {type(e).__name__}: {e}", flush=True)
+
             await emit(
-                {
-                    "type": "message",
-                    "data": {
-                        "content": f"\n\n📊 [Download {name}](/api/v1/files/{file_id}/content)"
-                    },
-                }
+                {"type": "message", "data": {"content": f"\n\n📊 [Download {name}]({url})"}}
             )
-            await notify(f"{name} ready — download link added to the message.", "success")
-            await status(f"{name} ready", done=True)
+            # The URL goes in the toast and the server log too: if neither the
+            # chip nor the link renders, it can still be opened by hand.
+            await notify(f"{name} ready — {url}", "success")
+            await status(f"{name} ready — {url}", done=True)
         except Exception as e:
             msg = f"openPPT export failed: {type(e).__name__}: {e}"
             await notify(msg, "error")

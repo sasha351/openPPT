@@ -31,11 +31,13 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 > **No button showing?** Open WebUI only renders Action buttons for models **saved in its database** — models pulled live from Ollama, or reached through a **direct OpenAI-API connection**, don't get them, even with the function enabled globally and no load errors. Fix: **Workspace → Models → ➕**, set the **Base Model** to the model you chat with, save, then use that custom model. The button (and the Template Primer filter) attach to the custom model. This is the most common reason the button never appears.
 
+> **Where does the deck show up?** Three places, so a version that ignores one still delivers: as an **attachment chip** under the message (click it to preview or download), as a **📊 Download link** appended to the message text, and as the raw URL (`/api/v1/files/<id>/content`) in the success toast and the server log — paste that onto your Open WebUI host if neither of the first two renders.
+
 > **Button shows but clicking it seems to do nothing?** It always reports back two ways: a **toast** in the browser, and a line in the Open WebUI **server log** prefixed `[openPPT]`. The usual cause is a message with no slide markers, and the toast says so. Note that a model preset can suppress the status line under a message via its `status_updates` capability — that hides statuses only, never the toast or the log. (Before v0.3.1, openPPT reported *only* through statuses, so a suppressed status looked exactly like a dead button.)
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.3.4** afterwards.
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.3.5** afterwards.
 
 ## Outline format
 
