@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.3.5
+version: 0.3.6
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -32,6 +32,12 @@ SEPARATOR_RE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
 QUOTE_RE = re.compile(r"^>\s*(.*)")
 BULLET_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.+)")
 LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+
+# Precedes the download link/URL the Action appends after a successful export.
+# An HTML comment renders invisibly in chat but survives round-tripping the
+# message back in, so re-clicking Export on an already-exported message (or a
+# model echoing it back) can't have that link parsed into a bogus bullet.
+DOWNLOAD_MARKER = "<!-- openppt:download -->"
 
 
 def _strip_md(text: str) -> str:
@@ -107,7 +113,9 @@ def parse_outline(markdown: str) -> list:
     '[links](url)' are flattened to plain text.
 
     Text before the first slide marker (chat prose) is ignored. Returns []
-    if no slides found.
+    if no slides found. Everything from the `DOWNLOAD_MARKER` line onward is
+    ignored too, so re-exporting a message that already has a download link
+    appended (from a prior export) doesn't parse that link into a bullet.
     """
     lines = markdown.splitlines()
     level_marker = _slide_level(lines)
@@ -123,6 +131,8 @@ def parse_outline(markdown: str) -> list:
 
     for raw in lines:
         line = raw.strip()
+        if line == DOWNLOAD_MARKER:
+            break  # everything after is the appended download link, not content
         if not line or line.startswith("```"):
             continue
 
@@ -462,7 +472,7 @@ class Action:
                         "type": "message",
                         "data": {
                             "content": (
-                                f"\n\n---\n**openPPT v0.3.5 diagnostic** — {help_text}\n\n"
+                                f"\n\n---\n**openPPT v0.3.6 diagnostic** — {help_text}\n\n"
                                 f"- messages in request: {len(messages)}\n"
                                 f"- body id: `{target}`\n"
                                 f"- content type: `{type(content).__name__}`, "
@@ -525,6 +535,12 @@ class Action:
             # a download). The markdown link covers versions whose event handler
             # ignores 'files'. Emitted separately so one failing can't lose both.
             url = f"/api/v1/files/{file_id}/content"
+            full_url = url
+            if __request__ is not None:
+                try:
+                    full_url = str(__request__.base_url).rstrip("/") + url
+                except Exception:
+                    pass
             try:
                 await emit(
                     {
@@ -553,13 +569,24 @@ class Action:
             except Exception as e:
                 print(f"[openPPT] files event rejected: {type(e).__name__}: {e}", flush=True)
 
+            # The marker line lets a future export ignore everything below it
+            # (see parse_outline) — otherwise re-clicking Export on this same
+            # message would parse this link into a bogus trailing bullet. The
+            # full URL repeated on its own line is copy-pasteable even where
+            # neither the chip nor the markdown link renders.
             await emit(
-                {"type": "message", "data": {"content": f"\n\n📊 [Download {name}]({url})"}}
+                {
+                    "type": "message",
+                    "data": {
+                        "content": (
+                            f"\n\n{DOWNLOAD_MARKER}\n📊 [Download {name}]({full_url})"
+                            f"\n\n{full_url}"
+                        )
+                    },
+                }
             )
-            # The URL goes in the toast and the server log too: if neither the
-            # chip nor the link renders, it can still be opened by hand.
-            await notify(f"{name} ready — {url}", "success")
-            await status(f"{name} ready — {url}", done=True)
+            await notify(f"{name} ready — {full_url}", "success")
+            await status(f"{name} ready — {full_url}", done=True)
         except Exception as e:
             msg = f"openPPT export failed: {type(e).__name__}: {e}"
             await notify(msg, "error")

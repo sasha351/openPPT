@@ -3,6 +3,7 @@ import io
 from pptx import Presentation
 
 from openppt_action import (
+    DOWNLOAD_MARKER,
     _find_layout_by_name,
     build_pptx,
     list_layouts,
@@ -122,6 +123,18 @@ def test_tolerance_does_not_break_layouts_or_images():
     assert slides[1]["bullets"] == [(0, {"alt": "alt", "image": "http://x/y.png"})]
 
 
+def test_ignores_appended_download_link():
+    """Re-exporting a message that already has a download link shouldn't
+    turn that link into a bogus trailing bullet."""
+    appended = (
+        SAMPLE
+        + f"\n{DOWNLOAD_MARKER}\n📊 [Download deck.pptx](/api/v1/files/abc/content)"
+        + "\n\nhttp://host/api/v1/files/abc/content\n"
+    )
+    slides = parse_outline(appended)
+    assert slides == parse_outline(SAMPLE)
+
+
 def test_never_raises():
     for junk in ["", "\x00�🙂" * 100, "#" * 500, "- \n" * 5000, "```\nunclosed"]:
         assert isinstance(parse_outline(junk), list)
@@ -191,7 +204,11 @@ def test_list_layouts_reports_names():
     assert "Title Slide" in names and "Title and Content" in names
 
 
-def _run_action(async_api: bool):
+class _FakeRequest:
+    base_url = "http://host.example/"
+
+
+def _run_action(async_api: bool, __request__=None):
     """Drive Action.action against stand-in Open WebUI Files/Storage modules.
 
     Open WebUI's Files API is sync in older versions and async in current ones,
@@ -271,7 +288,14 @@ def _run_action(async_api: bool):
     }
     sys.modules.update(fakes)
     try:
-        asyncio.run(Action().action(body, __user__={"id": "u1"}, __event_emitter__=emitter))
+        asyncio.run(
+            Action().action(
+                body,
+                __user__={"id": "u1"},
+                __event_emitter__=emitter,
+                __request__=__request__,
+            )
+        )
     finally:
         for key in fakes:
             sys.modules.pop(key, None)
@@ -298,6 +322,18 @@ def test_action_inserts_the_file_and_links_to_it():
         assert chip["type"] == "file" and chip["name"].endswith(".pptx")
         # and the attached .pptx was picked up as the template
         assert "on your template" in descriptions
+
+
+def test_action_appends_full_url_when_request_available():
+    events, inserted = _run_action(False, __request__=_FakeRequest())
+    (file_id,) = inserted
+    full_link = f"http://host.example/api/v1/files/{file_id}/content"
+    contents = [str(e["data"].get("content", "")) for e in events]
+    (download_msg,) = [c for c in contents if "📊" in c]
+    assert full_link in download_msg
+    assert DOWNLOAD_MARKER in download_msg
+    # the full URL is repeated as its own line, after everything else
+    assert download_msg.rstrip().endswith(full_link)
 
 
 if __name__ == "__main__":
