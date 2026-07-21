@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.3.1
+version: 0.3.2
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
