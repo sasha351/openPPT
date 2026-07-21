@@ -433,10 +433,13 @@ class Action:
 
             slides = parse_outline(content)
             if not slides:
+                # ponytail: echo what we actually read — "no outline" and "read the
+                # wrong/empty message" produce the same failure otherwise.
+                seen = " ".join(str(content).split())[:120] or "(empty message)"
                 help_text = (
                     "openPPT: nothing slide-shaped in that message. Ask the model for an "
                     "outline — '# Slide Title' headings with '-' bullets (or 'Slide 1: Title', "
-                    "or '---' between slides)."
+                    f"or '---' between slides). Read from message: {seen}"
                 )
                 await notify(help_text, "warning")
                 await status(help_text, done=True)
