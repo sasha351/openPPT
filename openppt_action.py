@@ -18,6 +18,13 @@ from pptx.util import Pt
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
+# Marker leading every block openPPT appends to a chat message. Anything after
+# it is our own output — a download link, a diagnostic — and is stripped before
+# parsing, so clicking export twice can't turn openPPT's own text into slides.
+# ponytail: an HTML comment so Markdown hides it; if a future Open WebUI
+# renders it literally, swap the string, nothing else depends on its shape.
+APPENDIX_MARKER = "<!-- openPPT -->"
+
 IMAGE_RE = re.compile(r"^!\[(.*?)\]\((.*?)\)$")
 NOTES_RE = re.compile(r"^notes?:\s*(.*)$", re.IGNORECASE)
 # '# Title @layout: Section Header' or '# Title {layout: Section Header}'
@@ -418,6 +425,35 @@ def build_pptx(slides: list, template=None) -> bytes:
     return buf.getvalue()
 
 
+def _strip_appendix(text: str) -> str:
+    """Drop anything openPPT appended to a message on an earlier click."""
+    return (text or "").split(APPENDIX_MARKER)[0]
+
+
+def _pick_outline(messages: list, target=None) -> str:
+    """Content to export: the clicked assistant message, else the newest one
+    that actually holds an outline.
+
+    Open WebUI sometimes hands the action a message whose content is empty, and
+    a strict clicked-message-only read then reports "no outline" at a chat that
+    plainly has one. Returns the clicked/newest text when nothing parses, so
+    the caller can echo what it actually read.
+    """
+    candidates = []
+    for msg in reversed(messages or []):
+        if msg.get("role") != "assistant":
+            continue
+        text = _strip_appendix(msg.get("content") or "")
+        if target is not None and msg.get("id") == target:
+            candidates.insert(0, text)
+        else:
+            candidates.append(text)
+    for text in candidates:
+        if parse_outline(text):
+            return text
+    return candidates[0] if candidates else ""
+
+
 class Action:
     async def action(
         self,
@@ -442,17 +478,7 @@ class Action:
         try:
             messages = body.get("messages", [])
             target = body.get("id")
-            content = ""
-            for msg in reversed(messages):
-                if msg.get("role") == "assistant" and (target is None or msg.get("id") == target):
-                    content = msg.get("content", "")
-                    break
-            else:  # clicked message not in the list — fall back to the latest reply
-                for msg in reversed(messages):
-                    if msg.get("role") == "assistant":
-                        content = msg.get("content", "")
-                        break
-
+            content = _pick_outline(messages, target)
             slides = parse_outline(content)
             if not slides:
                 # ponytail: echo what we actually read — "no outline" and "read the

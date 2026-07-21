@@ -3,8 +3,10 @@ import io
 from pptx import Presentation
 
 from openppt_action import (
+    APPENDIX_MARKER,
     DOWNLOAD_MARKER,
     _find_layout_by_name,
+    _pick_outline,
     build_pptx,
     list_layouts,
     parse_outline,
@@ -138,6 +140,35 @@ def test_ignores_appended_download_link():
 def test_never_raises():
     for junk in ["", "\x00�🙂" * 100, "#" * 500, "- \n" * 5000, "```\nunclosed"]:
         assert isinstance(parse_outline(junk), list)
+
+
+def test_pick_outline_falls_back_when_the_clicked_message_is_empty():
+    """Open WebUI sometimes hands the action a message with no content at all;
+    reporting 'no outline' at a chat that plainly has one is the failure that
+    started the v0.3.5 diagnostic-exported-as-a-deck chain."""
+    messages = [
+        {"id": "a", "role": "assistant", "content": SAMPLE},
+        {"id": "b", "role": "user", "content": "export it"},
+        {"id": "c", "role": "assistant", "content": ""},
+    ]
+    assert _pick_outline(messages, "c") == SAMPLE
+    assert _pick_outline(messages, None) == SAMPLE
+    assert _pick_outline([], None) == ""
+    assert _pick_outline([{"id": "c", "role": "assistant", "content": ""}], "c") == ""
+
+
+def test_pick_outline_strips_what_openppt_appended():
+    """Exporting twice must not turn our own download link into a bullet."""
+    content = (
+        SAMPLE
+        + f"\n\n{APPENDIX_MARKER}\n\n"
+        + "📊 [Download deck.pptx](/api/v1/files/x/content)\n"
+    )
+    slides = parse_outline(_pick_outline([{"id": "a", "role": "assistant", "content": content}], "a"))
+    assert len(slides) == 4
+    assert slides[-1]["bullets"] == [
+        (0, {"alt": "Team offsite", "image": "https://example.com/team.jpg"})
+    ]
 
 
 def test_build_pptx():
