@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.3.2
+version: 0.3.3
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -435,14 +435,31 @@ class Action:
             if not slides:
                 # ponytail: echo what we actually read — "no outline" and "read the
                 # wrong/empty message" produce the same failure otherwise.
-                seen = " ".join(str(content).split())[:120] or "(empty message)"
                 help_text = (
                     "openPPT: nothing slide-shaped in that message. Ask the model for an "
                     "outline — '# Slide Title' headings with '-' bullets (or 'Slide 1: Title', "
-                    f"or '---' between slides). Read from message: {seen}"
+                    "or '---' between slides)."
                 )
                 await notify(help_text, "warning")
                 await status(help_text, done=True)
+                # Toasts and the status line get truncated, so the diagnostic goes
+                # into the chat: what type the content was and how it starts.
+                seen = str(content)[:400] if content else "(empty)"
+                await emit(
+                    {
+                        "type": "message",
+                        "data": {
+                            "content": (
+                                f"\n\n---\n**openPPT v0.3.3 diagnostic** — {help_text}\n\n"
+                                f"- messages in request: {len(messages)}\n"
+                                f"- body id: `{target}`\n"
+                                f"- content type: `{type(content).__name__}`, "
+                                f"length {len(content) if hasattr(content, '__len__') else 'n/a'}\n\n"
+                                f"What it parsed:\n\n```\n{seen}\n```\n"
+                            )
+                        },
+                    }
+                )
                 return
 
             template = self._find_template(body, __user__)
