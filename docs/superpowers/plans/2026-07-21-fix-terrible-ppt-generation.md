@@ -197,22 +197,26 @@ git commit -m "Pick the newest message that has an outline, and ignore openPPT's
 ### Task 2: A diagnostic that can't become a deck
 
 **Files:**
-- Modify: `openppt_action.py` (add `VERSION` constant; rewrite the `if not slides:` block at lines 447-475)
-- Test: `test_parser.py` (parameterize `_run_action`, add one test)
+- Modify: `openppt_action.py` (collapse two markers into one; add `VERSION` constant; rewrite the `if not slides:` block)
+- Test: `test_parser.py` (parameterize `_run_action`, add one test, update marker references)
 
 **Interfaces:**
-- Consumes: `APPENDIX_MARKER` from Task 1.
-- Produces: `VERSION: str` module constant (`"0.4.0"`), kept equal to the docstring's `version:` line. `_run_action(async_api: bool, content: str = SAMPLE)` in the test file.
+- Consumes: `APPENDIX_MARKER` and `_pick_outline` from Task 1.
+- Produces: `VERSION: str` module constant (`"0.4.0"`), kept equal to the docstring's `version:` line. `_run_action(async_api: bool, content: str = SAMPLE)` in the test file. `APPENDIX_MARKER` becomes the single marker for all appended text; `DOWNLOAD_MARKER` and `_strip_appendix` no longer exist.
+
+> **Line numbers in this task are stale.** A parallel commit (`762428c`, v0.3.6) landed after this plan was written; locate code by its text, not by line number.
+
+**First: collapse the duplicate markers.** v0.3.6 independently added `DOWNLOAD_MARKER = "<!-- openppt:download -->"` plus a `break` inside `parse_outline`, covering the same double-export bug as Task 1's `APPENDIX_MARKER`/`_strip_appendix`. Two mechanisms for one job is exactly the duplication this codebase can't afford. Keep the better-placed one — the `break` inside `parse_outline` protects every caller — under the more general name, and delete the rest. Backwards compatibility with the `<!-- openppt:download -->` literal is not required: v0.3.6 was committed minutes before this branch and has not been pasted into any Open WebUI install.
 
 - [ ] **Step 1: Write the failing test**
 
-In `test_parser.py`, change the `_run_action` signature (line 194) from `def _run_action(async_api: bool):` to:
+In `test_parser.py`, change the `_run_action` signature from `def _run_action(async_api: bool):` to:
 
 ```python
 def _run_action(async_api: bool, content: str = SAMPLE):
 ```
 
-and in its `body` dict (lines 265-271) change the assistant message to use it:
+and in its `body` dict change the assistant message to use it:
 
 ```python
     body = {
@@ -246,9 +250,55 @@ def test_no_outline_diagnostic_is_not_itself_slide_shaped():
 Run: `.venv/bin/python -m pytest test_parser.py -k diagnostic -v`
 Expected: FAIL — `assert APPENDIX_MARKER in posted` (the current diagnostic has no marker), and `parse_outline(posted)` returns one slide rather than `[]`.
 
-- [ ] **Step 3: Rewrite the diagnostic**
+- [ ] **Step 3: Collapse the two markers into one**
 
-In `openppt_action.py`, add below the `APPENDIX_MARKER` block from Task 1:
+Four edits in `openppt_action.py`:
+
+1. Delete the `APPENDIX_MARKER = "<!-- openPPT -->"` block Task 1 added near the top (with its comment), and delete `_strip_appendix` entirely.
+2. Replace the `DOWNLOAD_MARKER` definition (the block above `_strip_md`, currently `DOWNLOAD_MARKER = "<!-- openppt:download -->"` with its four-line comment) with:
+
+```python
+# Precedes anything openPPT appends to a chat message — the download link, the
+# no-outline diagnostic. An HTML comment renders invisibly in chat but survives
+# a round trip back in, and parse_outline stops at this line, so re-clicking
+# Export can't parse openPPT's own output back into slides (v0.3.5 exported its
+# own error report as a deck).
+APPENDIX_MARKER = "<!-- openppt -->"
+```
+
+3. In `parse_outline`, change the break line and the docstring sentence that names the constant:
+
+```python
+        if line == APPENDIX_MARKER:
+            break  # everything below is openPPT's own appended output
+```
+
+```python
+    Text before the first slide marker (chat prose) is ignored. Returns []
+    if no slides found. Everything from the `APPENDIX_MARKER` line onward is
+    ignored too, so re-exporting a message openPPT already appended to (a
+    download link, a diagnostic) doesn't parse that text back into slides.
+```
+
+4. In `_pick_outline`, drop the `_strip_appendix` call — `parse_outline` now handles the marker:
+
+```python
+        text = msg.get("content") or ""
+```
+
+In `test_parser.py`, change the `DOWNLOAD_MARKER` import to `APPENDIX_MARKER` (the import list is alphabetical) and update its two other uses to `APPENDIX_MARKER`. Task 1's `APPENDIX_MARKER` import stays; there must be exactly one marker name in the file afterwards.
+
+Verify no orphans remain:
+
+```bash
+grep -rn "DOWNLOAD_MARKER\|_strip_appendix" openppt_action.py test_parser.py
+```
+
+Expected: no output.
+
+- [ ] **Step 4: Rewrite the diagnostic**
+
+In `openppt_action.py`, add directly below the `APPENDIX_MARKER` block:
 
 ```python
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
@@ -256,7 +306,7 @@ In `openppt_action.py`, add below the `APPENDIX_MARKER` block from Task 1:
 VERSION = "0.4.0"
 ```
 
-Then replace the whole `if not slides:` block (lines 447-475, from `if not slides:` through `return`) with:
+Then replace the whole `if not slides:` block (from `if not slides:` through its `return`) with:
 
 ```python
             if not slides:
@@ -290,38 +340,25 @@ Then replace the whole `if not slides:` block (lines 447-475, from `if not slide
                 return
 ```
 
-- [ ] **Step 4: Mark the success message as appended output too**
+- [ ] **Step 5: Point the download emit at the renamed marker**
 
-In `openppt_action.py`, replace the download-link emit (currently lines 556-558):
-
-```python
-            await emit(
-                {"type": "message", "data": {"content": f"\n\n📊 [Download {name}]({url})"}}
-            )
-```
-
-with:
+The success message already sits behind a marker (v0.3.6 added it); it just names the deleted constant. In `openppt_action.py`, in the `await emit` that posts the download link, change `f"\n\n{DOWNLOAD_MARKER}\n📊 [Download {name}]({full_url})"` to:
 
 ```python
-            await emit(
-                {
-                    "type": "message",
-                    "data": {
-                        "content": f"\n\n{APPENDIX_MARKER}\n📊 [Download {name}]({url})"
-                    },
-                }
-            )
+                            f"\n\n{APPENDIX_MARKER}\n📊 [Download {name}]({full_url})"
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+Leave the rest of that emit — the trailing `f"\n\n{full_url}"` line and the comment above it — alone, except to update the comment's `parse_outline` reference if it names the old constant.
+
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest test_parser.py -v`
-Expected: PASS — all tests. `test_action_inserts_the_file_and_links_to_it` still finds the link, because it asserts the URL is *in* the emitted content.
+Expected: PASS — all tests, including the v0.3.6 download-marker test and Task 1's `_pick_outline` tests.
 
-Run: `.venv/bin/python test_parser.py`
-Expected: prints `ok`
+Run: `.venv/bin/python test_parser.py && .venv/bin/python test_filter.py`
+Expected: `ok` from each.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add openppt_action.py test_parser.py
@@ -502,19 +539,19 @@ Expected: `version 0.4.0`
 
 - [ ] **Step 3: Update README.md**
 
-In `README.md` line 40, change `Confirm the version reads **0.3.5** afterwards.` to:
+In `README.md`, change `Confirm the version reads **0.3.6** afterwards.` (in "Updating an existing install") to:
 
 ```markdown
 Confirm the version reads **0.4.0** afterwards.
 ```
 
-In `README.md` line 36, append this sentence to the end of the "Button shows but clicking it seems to do nothing?" paragraph:
+In `README.md`, append this sentence to the end of the "Button shows but clicking it seems to do nothing?" paragraph:
 
 ```markdown
  If openPPT reports no outline, it posts a short diagnostic under the message saying what it actually read; that diagnostic is deliberately not slide-shaped, so clicking export again re-reads your outline rather than exporting the error report (which is what v0.3.5 did).
 ```
 
-At the end of `README.md` (after line 145), add:
+At the end of `README.md`, after the existing version-notes paragraphs, add:
 
 ```markdown
 v0.4.0 fixes exports that came out garbled: openPPT now ignores text it appended to a message itself (its own download link or diagnostic) instead of parsing it back into slides, falls back to the newest message that actually holds an outline when the clicked one arrives empty, and shrinks long titles and dense bullet lists to fit their placeholders instead of letting them overflow across the slide.
