@@ -191,6 +191,110 @@ def test_list_layouts_reports_names():
     assert "Title Slide" in names and "Title and Content" in names
 
 
+def _run_action(async_api: bool):
+    """Drive Action.action against stand-in Open WebUI Files/Storage modules.
+
+    Open WebUI's Files API is sync in older versions and async in current ones,
+    so both shapes have to work. The async fakes only record their effect
+    *inside* the coroutine — a dropped 'await' therefore shows up as a missing
+    file record rather than passing silently.
+    """
+    import asyncio
+    import sys
+    import tempfile
+    import types
+
+    from openppt_action import Action
+
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as fh:
+        fh.write(_make_template_bytes())
+        template_path = fh.name
+
+    inserted = {}
+
+    class Record:
+        filename = "brand.pptx"
+        path = template_path
+
+    class Files:
+        @staticmethod
+        def insert_new_file(user_id, form):
+            async def _insert():
+                inserted[form["id"]] = form
+                return form
+
+            if async_api:
+                return _insert()
+            inserted[form["id"]] = form
+            return form
+
+        @staticmethod
+        def get_file_by_id(fid):
+            async def _get():
+                return Record()
+
+            return _get() if async_api else Record()
+
+    class Storage:
+        @staticmethod
+        def upload_file(stream, filename, tags=None):
+            return stream.read(), f"/data/{filename}"
+
+        @staticmethod
+        def get_file(path):
+            return path
+
+    files_mod = types.ModuleType("open_webui.models.files")
+    files_mod.Files = Files
+    files_mod.FileForm = lambda **kw: kw
+    storage_mod = types.ModuleType("open_webui.storage.provider")
+    storage_mod.Storage = Storage
+    fakes = {
+        "open_webui": types.ModuleType("open_webui"),
+        "open_webui.models": types.ModuleType("open_webui.models"),
+        "open_webui.models.files": files_mod,
+        "open_webui.storage": types.ModuleType("open_webui.storage"),
+        "open_webui.storage.provider": storage_mod,
+    }
+
+    events = []
+
+    async def emitter(event):
+        events.append(event)
+
+    body = {
+        "id": "m1",
+        "messages": [
+            {"id": "m0", "role": "user", "content": "deck please", "files": [{"id": "f1"}]},
+            {"id": "m1", "role": "assistant", "content": SAMPLE},
+        ],
+    }
+    sys.modules.update(fakes)
+    try:
+        asyncio.run(Action().action(body, __user__={"id": "u1"}, __event_emitter__=emitter))
+    finally:
+        for key in fakes:
+            sys.modules.pop(key, None)
+    return events, inserted
+
+
+def test_action_inserts_the_file_and_links_to_it():
+    for async_api in (False, True):
+        events, inserted = _run_action(async_api)
+        descriptions = " ".join(
+            str(e["data"].get("description", "")) + str(e["data"].get("content", ""))
+            for e in events
+        )
+        assert "failed" not in descriptions, descriptions
+        # the record has to exist, or the link 404s under a "ready" toast
+        (file_id,) = inserted
+        assert inserted[file_id]["meta"]["size"] > 0
+        link = f"/api/v1/files/{file_id}/content"
+        assert any(link in str(e["data"].get("content", "")) for e in events), events
+        # and the attached .pptx was picked up as the template
+        assert "on your template" in descriptions
+
+
 if __name__ == "__main__":
     for _name, _fn in sorted(list(globals().items())):
         if _name.startswith("test_"):

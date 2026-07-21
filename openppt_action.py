@@ -1,11 +1,12 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.3.3
+version: 0.3.4
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
 
+import inspect
 import io
 import re
 import urllib.request
@@ -176,6 +177,15 @@ def parse_outline(markdown: str) -> list:
         else:
             slide["bullets"].append((level, _strip_md(text)))
     return slides
+
+
+async def _maybe_await(value):
+    """Open WebUI's Files API turned async; a pasted Function must fit both.
+
+    Calling an async Files method without awaiting returns a coroutine that
+    never runs — the insert silently doesn't happen and the download 404s.
+    """
+    return await value if inspect.isawaitable(value) else value
 
 
 def _fetch_image(url: str):
@@ -450,7 +460,7 @@ class Action:
                         "type": "message",
                         "data": {
                             "content": (
-                                f"\n\n---\n**openPPT v0.3.3 diagnostic** — {help_text}\n\n"
+                                f"\n\n---\n**openPPT v0.3.4 diagnostic** — {help_text}\n\n"
                                 f"- messages in request: {len(messages)}\n"
                                 f"- body id: `{target}`\n"
                                 f"- content type: `{type(content).__name__}`, "
@@ -462,7 +472,7 @@ class Action:
                 )
                 return
 
-            template = self._find_template(body, __user__)
+            template = await self._find_template(body, __user__)
             wants_layout = any(s.get("layout") for s in slides)
             if wants_layout and template is None:
                 await status(
@@ -490,20 +500,26 @@ class Action:
                 )
             except TypeError:  # older Open WebUI: no tags param
                 _, file_path = Storage.upload_file(io.BytesIO(data), f"{file_id}_{name}")
-            Files.insert_new_file(
-                __user__["id"],
-                FileForm(
-                    id=file_id,
-                    filename=name,
-                    path=file_path,
-                    data={},
-                    meta={
-                        "name": name,
-                        "content_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                        "size": len(data),
-                    },
-                ),
+            record = await _maybe_await(
+                Files.insert_new_file(
+                    __user__["id"],
+                    FileForm(
+                        id=file_id,
+                        filename=name,
+                        path=file_path,
+                        data={},
+                        meta={
+                            "name": name,
+                            "content_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                            "size": len(data),
+                        },
+                    ),
+                )
             )
+            # insert_new_file returns None on failure instead of raising — without
+            # this the link is posted and 404s ("download ready", nothing downloads).
+            if record is None:
+                raise RuntimeError("Open WebUI rejected the file record")
 
             await emit(
                 {
@@ -520,7 +536,7 @@ class Action:
             await notify(msg, "error")
             await status(msg, done=True)
 
-    def _find_template(self, body: dict, __user__: dict):
+    async def _find_template(self, body: dict, __user__: dict):
         """Return template bytes from the most recent .pptx/.potx attached to
         the chat, or None. Files can be attached to any message or ride along
         in body['files']; we scan newest-first and load the first template."""
@@ -543,7 +559,7 @@ class Action:
 
         for fid, hint in file_ids():
             try:
-                rec = Files.get_file_by_id(fid)
+                rec = await _maybe_await(Files.get_file_by_id(fid))
                 if rec is None:
                     continue
                 fname = (rec.filename or hint or "").lower()
