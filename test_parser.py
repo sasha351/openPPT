@@ -222,6 +222,30 @@ def test_body_bullets_land_in_a_placeholder():
     assert "first" in texts and "second" in texts
 
 
+def test_long_title_shrinks_instead_of_overlapping_the_body():
+    """python-pptx can't recompute PowerPoint's autofit, so a long title keeps
+    the template's ~44pt and spills across the slide over the bullets."""
+    long_title = "openPPT: nothing slide-shaped in that message. " * 4
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(f"# {long_title}\n- a\n"))))
+    frame = out.slides[0].shapes.title.text_frame
+    assert frame.word_wrap is True
+    assert frame.paragraphs[0].font.size.pt <= 20
+
+
+def test_short_title_keeps_the_templates_own_size():
+    out = Presentation(io.BytesIO(build_pptx(parse_outline("# Q3 Results\n- a\n"))))
+    # None = inherited from the layout; we must not restyle a title that fits
+    assert out.slides[0].shapes.title.text_frame.paragraphs[0].font.size is None
+
+
+def test_dense_bullet_list_shrinks():
+    outline = "# Ideas\n" + "".join(f"- point {i}\n" for i in range(14))
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(outline))))
+    (body,) = [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
+    assert len(body.text_frame.paragraphs) == 14
+    assert body.text_frame.paragraphs[0].font.size.pt <= 14
+
+
 def test_find_layout_by_name_is_fuzzy():
     prs = Presentation()
     assert _find_layout_by_name(prs, "section header").name == "Section Header"

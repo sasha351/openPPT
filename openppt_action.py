@@ -14,6 +14,7 @@ import uuid
 
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.util import Pt
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -361,18 +362,52 @@ def _body_placeholder(slide):
     return None
 
 
+def _title_size(text: str):
+    """Point size for a title long enough to overflow, or None to keep the
+    template's. python-pptx never recomputes PowerPoint's autofit, so without
+    this a 200-character title renders at full size across the whole slide."""
+    for limit, size in ((50, None), (80, 32), (120, 26), (200, 20)):
+        if len(text) <= limit:
+            return size
+    return 16
+
+
+def _body_size(bullets) -> int:
+    """Point size for a bullet list, shrinking as it gets denser. Long bullets
+    wrap, so count the lines they'll take rather than the bullets."""
+    lines = sum(1 + len(text) // 60 for _, text in bullets)
+    for limit, size in ((5, 20), (8, 16), (12, 14)):
+        if lines <= limit:
+            return size
+    return 12
+
+
+def _fit(text_frame) -> None:
+    """Wrap, and let PowerPoint shrink further than our estimate if it must."""
+    text_frame.word_wrap = True
+    text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+
+
 def _set_title(slide, text: str) -> None:
     ph = _title_placeholder(slide)
-    if ph is not None:
-        ph.text = text
+    if ph is None or not ph.has_text_frame:
+        return
+    ph.text_frame.text = text
+    _fit(ph.text_frame)
+    size = _title_size(text)
+    if size:
+        for p in ph.text_frame.paragraphs:
+            p.font.size = Pt(size)
 
 
 def _fill_bullets(text_frame, bullets) -> None:
+    _fit(text_frame)
+    size = Pt(_body_size(bullets))
     for j, (level, text) in enumerate(bullets):
         p = text_frame.paragraphs[0] if j == 0 else text_frame.add_paragraph()
         p.text = text
         p.level = level
-        p.font.size = Pt(20)
+        p.font.size = size
 
 
 def build_pptx(slides: list, template=None) -> bytes:
