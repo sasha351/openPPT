@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.3.0
+version: 0.3.1
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -20,6 +20,49 @@ NOTES_RE = re.compile(r"^notes?:\s*(.*)$", re.IGNORECASE)
 # '# Title @layout: Section Header' or '# Title {layout: Section Header}'
 LAYOUT_RE = re.compile(r"\s*(?:@layout:|\{layout:)\s*([^}]+?)\}?\s*$", re.IGNORECASE)
 LAYOUT_LINE_RE = re.compile(r"^layout:\s*(.*)$", re.IGNORECASE)
+
+# Tolerant slide-start grammar: real models rarely stick to plain '# '.
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)")
+SLIDE_PREFIX_RE = re.compile(r"^\**slide\s*\d+\s*[:.\-]\s*(.+?)\**$", re.IGNORECASE)
+BOLD_ONLY_RE = re.compile(r"^\*\*(.+?)\*\*:?$")
+SEPARATOR_RE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
+QUOTE_RE = re.compile(r"^>\s*(.*)")
+BULLET_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.+)")
+LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+
+
+def _strip_md(text: str) -> str:
+    """Flatten inline Markdown so bullets read as plain text on a slide."""
+    return re.sub(r"[*`]+", "", LINK_RE.sub(r"\1", text)).strip()
+
+
+def _new_slide(title: str, layout: str = "") -> dict:
+    return {"title": title, "subtitle": "", "layout": layout, "notes": "", "bullets": []}
+
+
+def _split_layout(title: str):
+    """Pull a trailing '@layout: X' / '{layout: X}' off a heading title."""
+    m = LAYOUT_RE.search(title)
+    if m:
+        return title[: m.start()].strip(), m.group(1).strip()
+    return title, ""
+
+
+def _slide_level(lines) -> int:
+    """Heading level that marks slides: whichever is most frequent.
+
+    A deck written with '## ' slides and one '# ' deck title should not treat
+    every '## ' as a bullet, which is what keying on '# ' alone does.
+    """
+    counts = {}
+    for raw in lines:
+        m = HEADING_RE.match(raw.strip())
+        if m:
+            counts[len(m.group(1))] = counts.get(len(m.group(1)), 0) + 1
+    if not counts:
+        return 0
+    top = max(counts.values())
+    return min(lvl for lvl, n in counts.items() if n == top)
 
 # Placeholder type groups (see PP_PLACEHOLDER).
 TITLE_TYPES = (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
@@ -51,34 +94,70 @@ def parse_outline(markdown: str) -> list:
     (or '{layout: Section Header}') — or on its own 'Layout: <name>' line.
     The name is matched against the template's layouts in build_pptx.
 
-    Text before the first '#' (chat prose) is ignored. Returns [] if no
-    slides found.
+    The grammar is tolerant, because local models rarely emit plain '# '
+    exactly. Slides start at whichever heading level is most frequent, so a
+    '## '-per-slide deck works and a lone '# ' above it becomes the deck
+    title. With no headings at all, 'Slide 3: Title' prefixes, lone
+    '**Bold Title**' lines and '---' separators start slides instead.
+    Bullets may use '-', '*', '+', '1.' or '1)', and '> ' quoted lines are
+    speaker notes alongside 'Notes:'. Inline '**bold**', '`code`' and
+    '[links](url)' are flattened to plain text.
+
+    Text before the first slide marker (chat prose) is ignored. Returns []
+    if no slides found.
     """
+    lines = markdown.splitlines()
+    level_marker = _slide_level(lines)
+
     slides = []
     slide = None
-    for raw in markdown.splitlines():
+    expect_title = False
+
+    def start(title, layout=""):
+        nonlocal slide
+        slide = _new_slide(title, layout)
+        slides.append(slide)
+
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("```"):
             continue
-        if line.startswith("# "):
-            title = line[2:].strip()
-            layout = ""
-            layout_match = LAYOUT_RE.search(title)
-            if layout_match:
-                layout = layout_match.group(1).strip()
-                title = title[: layout_match.start()].strip()
-            slide = {
-                "title": title,
-                "subtitle": "",
-                "layout": layout,
-                "notes": "",
-                "bullets": [],
-            }
-            slides.append(slide)
+
+        heading = HEADING_RE.match(line)
+        if heading and level_marker:
+            lvl = len(heading.group(1))
+            title, layout = _split_layout(heading.group(2).strip())
+            if lvl <= level_marker:
+                start(_strip_md(title), layout)
+                continue
+            if lvl == level_marker + 1 and len(slides) == 1 and not slide["bullets"]:
+                slide["subtitle"] = _strip_md(title)
+                continue
+            if slide is not None:
+                slide["bullets"].append((0, _strip_md(title)))
             continue
+
+        if not level_marker:
+            if SEPARATOR_RE.match(line):
+                expect_title = True
+                continue
+            prefixed = SLIDE_PREFIX_RE.match(line)
+            bolded = BOLD_ONLY_RE.match(line)
+            if prefixed or bolded:
+                title, layout = _split_layout((prefixed or bolded).group(1).strip())
+                start(_strip_md(title), layout)
+                expect_title = False
+                continue
+            if expect_title and not BULLET_RE.match(line):
+                title, layout = _split_layout(line)
+                start(_strip_md(title), layout)
+                expect_title = False
+                continue
+
         if slide is None:
             continue
-        notes_match = NOTES_RE.match(line)
+
+        notes_match = NOTES_RE.match(line) or QUOTE_RE.match(line)
         if notes_match:
             slide["notes"] = (slide["notes"] + "\n" + notes_match.group(1)).strip()
             continue
@@ -86,22 +165,16 @@ def parse_outline(markdown: str) -> list:
         if layout_line:
             slide["layout"] = layout_line.group(1).strip()
             continue
+
         indent = len(raw) - len(raw.lstrip())
         level = min(indent // 2, 4)
-        if line.startswith("## ") and len(slides) == 1 and not slide["bullets"]:
-            slide["subtitle"] = line[3:].strip()
-            continue
-        if line[:2] in ("- ", "* "):
-            text = line[2:].strip()
-        elif line.split(".", 1)[0].isdigit() and "." in line:
-            text = line.split(".", 1)[1].strip()
-        else:
-            text = line
+        bullet = BULLET_RE.match(line)
+        text = bullet.group(2).strip() if bullet else line
         image_match = IMAGE_RE.match(text)
         if image_match:
             slide["bullets"].append((level, {"alt": image_match.group(1), "image": image_match.group(2)}))
         else:
-            slide["bullets"].append((level, text))
+            slide["bullets"].append((level, _strip_md(text)))
     return slides
 
 
@@ -331,26 +404,42 @@ class Action:
         __event_emitter__=None,
         __request__=None,
     ):
-        async def status(desc, done=False):
+        async def emit(event):
             if __event_emitter__:
-                await __event_emitter__(
-                    {"type": "status", "data": {"description": desc, "done": done}}
-                )
+                await __event_emitter__(event)
+
+        async def status(desc, done=False):
+            await emit({"type": "status", "data": {"description": desc, "done": done}})
+
+        async def notify(content, kind="info"):
+            # A model preset can hide the status line via its status_updates
+            # capability, so every outcome also toasts and hits the server log.
+            print(f"[openPPT] {kind}: {content}", flush=True)
+            await emit({"type": "notification", "data": {"type": kind, "content": content}})
 
         try:
+            messages = body.get("messages", [])
+            target = body.get("id")
             content = ""
-            for msg in reversed(body.get("messages", [])):
-                if msg.get("role") == "assistant":
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant" and (target is None or msg.get("id") == target):
                     content = msg.get("content", "")
                     break
+            else:  # clicked message not in the list — fall back to the latest reply
+                for msg in reversed(messages):
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content", "")
+                        break
 
             slides = parse_outline(content)
             if not slides:
-                await status(
-                    "No slides found — ask the model to write the deck as "
-                    "'# Slide Title' headings with '-' bullets.",
-                    done=True,
+                help_text = (
+                    "openPPT: nothing slide-shaped in that message. Ask the model for an "
+                    "outline — '# Slide Title' headings with '-' bullets (or 'Slide 1: Title', "
+                    "or '---' between slides)."
                 )
+                await notify(help_text, "warning")
+                await status(help_text, done=True)
                 return
 
             template = self._find_template(body, __user__)
@@ -396,18 +485,20 @@ class Action:
                 ),
             )
 
-            if __event_emitter__:
-                await __event_emitter__(
-                    {
-                        "type": "message",
-                        "data": {
-                            "content": f"\n\n📊 [Download {name}](/api/v1/files/{file_id}/content)"
-                        },
-                    }
-                )
+            await emit(
+                {
+                    "type": "message",
+                    "data": {
+                        "content": f"\n\n📊 [Download {name}](/api/v1/files/{file_id}/content)"
+                    },
+                }
+            )
+            await notify(f"{name} ready — download link added to the message.", "success")
             await status(f"{name} ready", done=True)
         except Exception as e:
-            await status(f"PowerPoint export failed: {e}", done=True)
+            msg = f"openPPT export failed: {type(e).__name__}: {e}"
+            await notify(msg, "error")
+            await status(msg, done=True)
 
     def _find_template(self, body: dict, __user__: dict):
         """Return template bytes from the most recent .pptx/.potx attached to

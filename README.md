@@ -31,6 +31,12 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 > **No button showing?** Open WebUI only renders Action buttons for models **saved in its database** — models pulled live from Ollama, or reached through a **direct OpenAI-API connection**, don't get them, even with the function enabled globally and no load errors. Fix: **Workspace → Models → ➕**, set the **Base Model** to the model you chat with, save, then use that custom model. The button (and the Template Primer filter) attach to the custom model. This is the most common reason the button never appears.
 
+> **Button shows but clicking it seems to do nothing?** It always reports back two ways: a **toast** in the browser, and a line in the Open WebUI **server log** prefixed `[openPPT]`. The usual cause is a message with no slide markers, and the toast says so. Note that a model preset can suppress the status line under a message via its `status_updates` capability — that hides statuses only, never the toast or the log. (Before v0.3.1, openPPT reported *only* through statuses, so a suppressed status looked exactly like a dead button.)
+
+## Updating an existing install
+
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.3.1** afterwards.
+
 ## Outline format
 
 The button parses the assistant message it's clicked on:
@@ -40,18 +46,27 @@ The button parses the assistant message it's clicked on:
 ## Revenue up 12% YoY   ← its subtitle
 
 # Key Wins              ← '#' starts a slide
-- Launched EU region    ← '-', '*', or '1.' bullets
+- Launched EU region    ← '-', '*', '+', '1.', '1)' bullets
   - Best quarter ever   ← indent = nesting
 ```
 
 Prose before the first `#` (e.g. "Here's your deck:") is ignored.
 
-**Speaker notes:** a line starting with `Notes:` (anywhere in a slide, after its heading) becomes that slide's speaker notes.
+**The parser is tolerant**, because local models rarely stick to one format:
+
+- Slides start at whichever heading level is **most frequent**. A deck written with `## ` per slide works, and a lone `# ` above it becomes the deck title rather than a stray bullet.
+- With **no headings at all**, slides start at `Slide 3: Title` prefixes, lone `**Bold Title**` lines, or `---` separators.
+- Inline `**bold**`, `` `code` `` and `[links](url)` are flattened to plain text.
+
+Known gap: a deck using **only** `---` separators loses its first section, since treating leading prose as a slide would turn every chat message into a deck. Give the first slide a heading or a `Slide 1:` prefix.
+
+**Speaker notes:** a line starting with `Notes:` — or a `> ` blockquote — anywhere in a slide after its heading becomes that slide's speaker notes.
 
 ```markdown
 # Key Wins
 - Launched EU region
 Notes: mention the EU launch timeline if asked
+> or write the note as a blockquote
 ```
 
 **Images:** a bullet written as `![alt text](url or path)` embeds that image on the slide instead of a text bullet. A slide made up entirely of image bullets keeps its title and drops the bullet list in favor of the image(s); images that fail to load (bad URL, network error) are silently skipped so the export never fails because of one broken link.
@@ -124,3 +139,5 @@ pip install python-pptx pydantic && python test_parser.py && python test_filter.
 ```
 
 v0.3 scope: title + bullet slides, speaker notes, images, **custom `.pptx`/`.potx` templates**, per-slide layout selection by name, and a **template primer Filter** that turns "attach a template + dump content" into a formatted deck automatically. Placeholder mapping is generic (resolved by placeholder type), so it works on any template's layouts.
+
+v0.3.1 adds a tolerant parser (most-frequent heading level, heading-less fallbacks, inline-markdown stripping, `> ` notes) and makes every outcome report via a toast and the server log instead of the suppressible status line.

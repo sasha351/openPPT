@@ -76,6 +76,57 @@ def test_parse_layout_directives():
     assert slides[2]["bullets"] == [(0, "A bullet")]
 
 
+def test_h2_deck_slides_on_most_common_level():
+    """A '## '-per-slide deck: '#' above it is the deck title, not a bullet."""
+    slides = parse_outline("# Deck\n## One\n- a\n## Two\n- b\n## Three\n- c\n")
+    assert [s["title"] for s in slides] == ["Deck", "One", "Two", "Three"]
+    assert slides[1]["bullets"] == [(0, "a")]
+
+
+def test_headingless_fallbacks():
+    assert [s["title"] for s in parse_outline("Slide 1: Intro\n- a\nSlide 2: Body\n- b\n")] == [
+        "Intro",
+        "Body",
+    ]
+    assert [s["title"] for s in parse_outline("**Intro**\n- a\n\n**Body**\n- b\n")] == [
+        "Intro",
+        "Body",
+    ]
+    sep = parse_outline("Intro\n- a\n\n---\n\nBody\n- b\n")
+    assert [s["title"] for s in sep] == ["Body"]  # prose before the first marker is dropped
+    assert sep[0]["bullets"] == [(0, "b")]
+
+
+def test_extra_bullet_markers_and_inline_markdown():
+    (slide,) = parse_outline("# T\n+ plus\n2) paren\n- **bold** `code` [link](http://x)\n")
+    assert slide["bullets"] == [
+        (0, "plus"),
+        (0, "paren"),
+        (0, "bold code link"),
+    ]
+
+
+def test_blockquote_notes():
+    (slide,) = parse_outline("# T\n- a\n> quoted note\nNotes: and this\n")
+    assert slide["notes"] == "quoted note\nand this"
+    assert slide["bullets"] == [(0, "a")]
+
+
+def test_tolerance_does_not_break_layouts_or_images():
+    """New grammar must not eat the v0.3.0 directives it runs alongside."""
+    slides = parse_outline(
+        "## Roadmap @layout: Section Header\n## Photo\n- ![alt](http://x/y.png)\n"
+    )
+    assert slides[0]["layout"] == "Section Header"
+    assert slides[0]["title"] == "Roadmap"
+    assert slides[1]["bullets"] == [(0, {"alt": "alt", "image": "http://x/y.png"})]
+
+
+def test_never_raises():
+    for junk in ["", "\x00�🙂" * 100, "#" * 500, "- \n" * 5000, "```\nunclosed"]:
+        assert isinstance(parse_outline(junk), list)
+
+
 def test_build_pptx():
     data = build_pptx(parse_outline(SAMPLE))
     assert data[:2] == b"PK"  # .pptx is a zip
@@ -141,13 +192,7 @@ def test_list_layouts_reports_names():
 
 
 if __name__ == "__main__":
-    test_parse_outline()
-    test_parse_layout_directives()
-    test_build_pptx()
-    test_build_pptx_skips_unreachable_image()
-    test_build_with_template_clears_sample_slides()
-    test_layout_directive_selects_named_layout()
-    test_body_bullets_land_in_a_placeholder()
-    test_find_layout_by_name_is_fuzzy()
-    test_list_layouts_reports_names()
+    for _name, _fn in sorted(list(globals().items())):
+        if _name.startswith("test_"):
+            _fn()
     print("ok")
