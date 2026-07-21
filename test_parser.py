@@ -4,7 +4,6 @@ from pptx import Presentation
 
 from openppt_action import (
     APPENDIX_MARKER,
-    DOWNLOAD_MARKER,
     _find_layout_by_name,
     _pick_outline,
     build_pptx,
@@ -130,7 +129,7 @@ def test_ignores_appended_download_link():
     turn that link into a bogus trailing bullet."""
     appended = (
         SAMPLE
-        + f"\n{DOWNLOAD_MARKER}\n📊 [Download deck.pptx](/api/v1/files/abc/content)"
+        + f"\n{APPENDIX_MARKER}\n📊 [Download deck.pptx](/api/v1/files/abc/content)"
         + "\n\nhttp://host/api/v1/files/abc/content\n"
     )
     slides = parse_outline(appended)
@@ -239,7 +238,7 @@ class _FakeRequest:
     base_url = "http://host.example/"
 
 
-def _run_action(async_api: bool, __request__=None):
+def _run_action(async_api: bool, content: str = SAMPLE, __request__=None):
     """Drive Action.action against stand-in Open WebUI Files/Storage modules.
 
     Open WebUI's Files API is sync in older versions and async in current ones,
@@ -314,7 +313,7 @@ def _run_action(async_api: bool, __request__=None):
         "id": "m1",
         "messages": [
             {"id": "m0", "role": "user", "content": "deck please", "files": [{"id": "f1"}]},
-            {"id": "m1", "role": "assistant", "content": SAMPLE},
+            {"id": "m1", "role": "assistant", "content": content},
         ],
     }
     sys.modules.update(fakes)
@@ -355,6 +354,20 @@ def test_action_inserts_the_file_and_links_to_it():
         assert "on your template" in descriptions
 
 
+def test_no_outline_diagnostic_is_not_itself_slide_shaped():
+    """v0.3.5 posted an error report written in '---' + '- ' Markdown, so the
+    next click exported the error report as a deck."""
+    events, inserted = _run_action(False, content="Sorry, I can't help with that.")
+    assert inserted == {}  # nothing was built
+    (message,) = [e for e in events if e["type"] == "message"]
+    posted = message["data"]["content"]
+    assert APPENDIX_MARKER in posted
+    assert parse_outline(posted) == []
+    # and once appended to the message, it is invisible to the next click
+    appended = {"id": "m1", "role": "assistant", "content": "Sorry, I can't help with that." + posted}
+    assert _pick_outline([appended], "m1") == "Sorry, I can't help with that."
+
+
 def test_action_appends_full_url_when_request_available():
     events, inserted = _run_action(False, __request__=_FakeRequest())
     (file_id,) = inserted
@@ -362,7 +375,7 @@ def test_action_appends_full_url_when_request_available():
     contents = [str(e["data"].get("content", "")) for e in events]
     (download_msg,) = [c for c in contents if "📊" in c]
     assert full_link in download_msg
-    assert DOWNLOAD_MARKER in download_msg
+    assert APPENDIX_MARKER in download_msg
     # the full URL is repeated as its own line, after everything else
     assert download_msg.rstrip().endswith(full_link)
 

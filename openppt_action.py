@@ -18,13 +18,6 @@ from pptx.util import Pt
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-# Marker leading every block openPPT appends to a chat message. Anything after
-# it is our own output — a download link, a diagnostic — and is stripped before
-# parsing, so clicking export twice can't turn openPPT's own text into slides.
-# ponytail: an HTML comment so Markdown hides it; if a future Open WebUI
-# renders it literally, swap the string, nothing else depends on its shape.
-APPENDIX_MARKER = "<!-- openPPT -->"
-
 IMAGE_RE = re.compile(r"^!\[(.*?)\]\((.*?)\)$")
 NOTES_RE = re.compile(r"^notes?:\s*(.*)$", re.IGNORECASE)
 # '# Title @layout: Section Header' or '# Title {layout: Section Header}'
@@ -40,11 +33,16 @@ QUOTE_RE = re.compile(r"^>\s*(.*)")
 BULLET_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.+)")
 LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 
-# Precedes the download link/URL the Action appends after a successful export.
-# An HTML comment renders invisibly in chat but survives round-tripping the
-# message back in, so re-clicking Export on an already-exported message (or a
-# model echoing it back) can't have that link parsed into a bogus bullet.
-DOWNLOAD_MARKER = "<!-- openppt:download -->"
+# Precedes anything openPPT appends to a chat message — the download link, the
+# no-outline diagnostic. An HTML comment renders invisibly in chat but survives
+# a round trip back in, and parse_outline stops at this line, so re-clicking
+# Export can't parse openPPT's own output back into slides (v0.3.5 exported its
+# own error report as a deck).
+APPENDIX_MARKER = "<!-- openppt -->"
+
+# Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
+# Functions list is otherwise invisible, and the diagnostic is where it shows.
+VERSION = "0.4.0"
 
 
 def _strip_md(text: str) -> str:
@@ -120,9 +118,9 @@ def parse_outline(markdown: str) -> list:
     '[links](url)' are flattened to plain text.
 
     Text before the first slide marker (chat prose) is ignored. Returns []
-    if no slides found. Everything from the `DOWNLOAD_MARKER` line onward is
-    ignored too, so re-exporting a message that already has a download link
-    appended (from a prior export) doesn't parse that link into a bullet.
+    if no slides found. Everything from the `APPENDIX_MARKER` line onward is
+    ignored too, so re-exporting a message openPPT already appended to (a
+    download link, a diagnostic) doesn't parse that text back into slides.
     """
     lines = markdown.splitlines()
     level_marker = _slide_level(lines)
@@ -138,8 +136,8 @@ def parse_outline(markdown: str) -> list:
 
     for raw in lines:
         line = raw.strip()
-        if line == DOWNLOAD_MARKER:
-            break  # everything after is the appended download link, not content
+        if line == APPENDIX_MARKER:
+            break  # everything below is openPPT's own appended output
         if not line or line.startswith("```"):
             continue
 
@@ -425,11 +423,6 @@ def build_pptx(slides: list, template=None) -> bytes:
     return buf.getvalue()
 
 
-def _strip_appendix(text: str) -> str:
-    """Drop anything openPPT appended to a message on an earlier click."""
-    return (text or "").split(APPENDIX_MARKER)[0]
-
-
 def _pick_outline(messages: list, target=None) -> str:
     """Content to export: the clicked assistant message, else the newest one
     that actually holds an outline.
@@ -443,7 +436,16 @@ def _pick_outline(messages: list, target=None) -> str:
     for msg in reversed(messages or []):
         if msg.get("role") != "assistant":
             continue
-        text = _strip_appendix(msg.get("content") or "")
+        # Drop our own appended output (download link, diagnostic) so a
+        # re-click echoes back what the model wrote, not what we last posted.
+        # The blank line right before the marker is ours too (see the emits
+        # below), so trim it along with everything after — but only when the
+        # marker is actually present, or an ordinary message's own trailing
+        # whitespace would get eaten.
+        text = msg.get("content") or ""
+        before, marker, _ = text.partition(APPENDIX_MARKER)
+        if marker:
+            text = before.rstrip()
         if target is not None and msg.get("id") == target:
             candidates.insert(0, text)
         else:
@@ -481,29 +483,29 @@ class Action:
             content = _pick_outline(messages, target)
             slides = parse_outline(content)
             if not slides:
-                # ponytail: echo what we actually read — "no outline" and "read the
-                # wrong/empty message" produce the same failure otherwise.
                 help_text = (
-                    "openPPT: nothing slide-shaped in that message. Ask the model for an "
-                    "outline — '# Slide Title' headings with '-' bullets (or 'Slide 1: Title', "
-                    "or '---' between slides)."
+                    "openPPT: nothing slide-shaped in that message. Ask the model for "
+                    "an outline — a '# Slide Title' heading per slide, with '-' "
+                    "bullets under it."
                 )
                 await notify(help_text, "warning")
                 await status(help_text, done=True)
-                # Toasts and the status line get truncated, so the diagnostic goes
-                # into the chat: what type the content was and how it starts.
-                seen = str(content)[:400] if content else "(empty)"
+                # Toasts and the status line get truncated, so the detail goes in
+                # the chat. Written so parse_outline finds nothing in it: no '---'
+                # rule, no bullet list, no lone '**bold**' line — otherwise the
+                # next click exports this diagnostic as a deck (v0.3.5 did).
+                seen = content[:400] if content else "(nothing — the message was empty)"
                 await emit(
                     {
                         "type": "message",
                         "data": {
                             "content": (
-                                f"\n\n---\n**openPPT v0.3.6 diagnostic** — {help_text}\n\n"
-                                f"- messages in request: {len(messages)}\n"
-                                f"- body id: `{target}`\n"
-                                f"- content type: `{type(content).__name__}`, "
-                                f"length {len(content) if hasattr(content, '__len__') else 'n/a'}\n\n"
-                                f"What it parsed:\n\n```\n{seen}\n```\n"
+                                f"\n\n{APPENDIX_MARKER}\n"
+                                f"**openPPT {VERSION} diagnostic** — {help_text} "
+                                f"(messages in request: {len(messages)}, clicked id: "
+                                f"`{target}`, read {len(content)} characters)\n\n"
+                                f"What openPPT read from that message:\n\n"
+                                f"```\n{seen}\n```\n"
                             )
                         },
                     }
@@ -605,7 +607,7 @@ class Action:
                     "type": "message",
                     "data": {
                         "content": (
-                            f"\n\n{DOWNLOAD_MARKER}\n📊 [Download {name}]({full_url})"
+                            f"\n\n{APPENDIX_MARKER}\n📊 [Download {name}]({full_url})"
                             f"\n\n{full_url}"
                         )
                     },
