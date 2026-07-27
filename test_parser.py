@@ -420,15 +420,36 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None):
         def get_file(path):
             return path
 
+    class Chat:
+        # what Open WebUI persists: the attachment lives on the user message
+        chat = {
+            "messages": [
+                {"id": "m0", "role": "user", "content": "deck please",
+                 "files": [{"type": "file", "id": "f1", "name": "brand.pptx"}]},
+                {"id": "m1", "role": "assistant", "content": content},
+            ]
+        }
+
+    class Chats:
+        @staticmethod
+        def get_chat_by_id(cid):
+            async def _get():
+                return Chat()
+
+            return _get() if async_api else Chat()
+
     files_mod = types.ModuleType("open_webui.models.files")
     files_mod.Files = Files
     files_mod.FileForm = lambda **kw: kw
+    chats_mod = types.ModuleType("open_webui.models.chats")
+    chats_mod.Chats = Chats
     storage_mod = types.ModuleType("open_webui.storage.provider")
     storage_mod.Storage = Storage
     fakes = {
         "open_webui": types.ModuleType("open_webui"),
         "open_webui.models": types.ModuleType("open_webui.models"),
         "open_webui.models.files": files_mod,
+        "open_webui.models.chats": chats_mod,
         "open_webui.storage": types.ModuleType("open_webui.storage"),
         "open_webui.storage.provider": storage_mod,
     }
@@ -438,10 +459,14 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None):
     async def emitter(event):
         events.append(event)
 
+    # Exactly what Open WebUI POSTs to /api/chat/actions: no 'files' anywhere,
+    # each message stripped to id/role/content. The template has to be found
+    # through chat_id, or every export silently falls back to the plain theme.
     body = {
         "id": "m1",
+        "chat_id": "c1",
         "messages": [
-            {"id": "m0", "role": "user", "content": "deck please", "files": [{"id": "f1"}]},
+            {"id": "m0", "role": "user", "content": "deck please"},
             {"id": "m1", "role": "assistant", "content": content},
         ],
     }

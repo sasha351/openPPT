@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.5.0
+version: 0.5.1
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -46,7 +46,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 
 def _strip_md(text: str) -> str:
@@ -266,6 +266,18 @@ def _fetch_image(url: str):
             return io.BytesIO(f.read())
     except Exception:
         return None
+
+
+def _file_entries(files):
+    """(id, filename) for each attachment entry. Open WebUI has shipped both
+    a flat {'id','name'} and a nested {'file': {'id','filename'}} shape."""
+    for f in files or []:
+        if not isinstance(f, dict):
+            continue
+        inner = f.get("file") if isinstance(f.get("file"), dict) else {}
+        fid = inner.get("id") or f.get("id")
+        if fid:
+            yield fid, (f.get("name") or inner.get("filename") or "")
 
 
 def _ph_type(placeholder):
@@ -786,26 +798,43 @@ class Action:
 
     async def _find_template(self, body: dict, __user__: dict):
         """Return template bytes from the most recent .pptx/.potx attached to
-        the chat, or None. Files can be attached to any message or ride along
-        in body['files']; we scan newest-first and load the first template."""
+        the chat, or None.
+
+        The action request body has no attachments in it: Open WebUI maps every
+        message down to id/role/content/info/timestamp before POSTing to
+        /api/chat/actions, and sends no top-level 'files'. So the attachment is
+        read from the *saved* chat (body['chat_id']) — which keeps both the
+        per-message 'files' and the chat-level 'files' list. The body is still
+        scanned first, for versions or callers that do pass files along.
+        """
         try:
             from open_webui.models.files import Files
             from open_webui.storage.provider import Storage
         except Exception:
             return None
 
-        def file_ids():
-            for msg in reversed(body.get("messages", [])):
-                for f in msg.get("files", []) or []:
-                    fid = (f.get("file") or {}).get("id") or f.get("id")
-                    if fid:
-                        yield fid, (f.get("name") or (f.get("file") or {}).get("filename") or "")
-            for f in body.get("files", []) or []:
-                fid = (f.get("file") or {}).get("id") or f.get("id")
-                if fid:
-                    yield fid, (f.get("name") or (f.get("file") or {}).get("filename") or "")
+        def file_ids(container):
+            """(id, name) for each file in a {'messages': [...], 'files': [...]}
+            dict — message attachments newest-first, then chat-level ones."""
+            if not isinstance(container, dict):
+                return
+            messages = container.get("messages") or []
+            for msg in reversed(messages) if isinstance(messages, list) else []:
+                if isinstance(msg, dict):
+                    yield from _file_entries(msg.get("files"))
+            yield from _file_entries(container.get("files"))
 
-        for fid, hint in file_ids():
+        sources = [body]
+        if body.get("chat_id"):
+            try:
+                from open_webui.models.chats import Chats
+
+                chat = await _maybe_await(Chats.get_chat_by_id(body["chat_id"]))
+                sources.append(getattr(chat, "chat", None))
+            except Exception as e:
+                print(f"[openPPT] chat lookup failed: {type(e).__name__}: {e}", flush=True)
+
+        for fid, hint in (e for src in sources for e in file_ids(src)):
             try:
                 rec = await _maybe_await(Files.get_file_by_id(fid))
                 if rec is None:
