@@ -28,6 +28,10 @@ Hard rules:
 - Every slide starts with "# " at the start of a line. Nothing else starts with "# ".
 - The first slide is the title slide: "# Title" then "## Subtitle", and NO bullets.
 - Every other slide has 3-6 bullets, each under ~12 words. Push detail to "Notes:".
+- Make every bullet concrete: one specific number, name, date, or action verb —
+  never a topic label. If a bullet could describe any project unchanged
+  ("Improved efficiency", "Key considerations"), replace it with the real fact
+  from the content, or cut it.
 - Bullets start with "- ". Never bold a slide title, never write "Slide 1:",
   never use "---" separators, never wrap the whole outline in ``` fences.
 - "Notes:" lines are optional and go after that slide's bullets.

@@ -16,7 +16,7 @@ Two pieces make this work, and you install both:
 
 | Piece | File | What it does |
 |-------|------|--------------|
-| **Filter** | [`openppt_filter.py`](openppt_filter.py) | Runs *before* the model. Detects your attached template, reads its layouts, and primes the model to format your content into a flowing deck that fills those layouts. |
+| **Filter** | [`openppt_filter.py`](openppt_filter.py) | Runs *before* the model. Detects your attached template, reads its layouts, and primes the model to format your content into a flowing deck that fills those layouts. No template? It still primes plain deck/presentation requests with the outline format. |
 | **Action** | [`openppt_action.py`](openppt_action.py) | The **Export to PowerPoint** button. Turns the outline into a `.pptx` built on your template. |
 
 The Action works on its own (write an outline, click export). Add the Filter and you get the hands-off "template in, deck out" flow above.
@@ -130,9 +130,11 @@ for name, ph in list_layouts(open("brand.potx", "rb").read()):
 
 Drop those names into your model's system prompt so it picks layouts that actually exist in your template. (The Filter does exactly this on your behalf whenever a template is attached, so you rarely need to.)
 
-## No template? A "Presentation Builder" preset
+## No template? The Filter primes deck requests anyway
 
-The Filter only kicks in when a template is attached. For deck-building **without** a template, create a model preset (**Workspace → Models → + New**) based on your model (e.g. Gemma) with this system prompt:
+With the Filter installed, attaching a template isn't required: if the last message looks like a deck/presentation request (mentions "deck", "presentation", "slides", etc.), it injects the same outline format and content-quality bar without any layout list. Turn this off with the Filter's `prime_without_template` valve if you'd rather it only fire when a template is attached.
+
+If you'd rather not rely on the Filter (or it's disabled), create a model preset (**Workspace → Models → + New**) based on your model (e.g. Gemma) with this system prompt instead:
 
 ```
 You are a presentation builder. When the user asks for a presentation,
@@ -147,8 +149,9 @@ respond ONLY with a Markdown outline in exactly this format:
   - Sub-point (indent two spaces)
 
 Rules: start every slide with '# ', use 3-6 bullets per slide, keep
-bullets under 12 words, no prose outside the outline. When the user
-requests changes, reply with the full revised outline.
+bullets under 12 words, no prose outside the outline. Make every bullet
+concrete: one specific number, name, date, or action verb — never a topic
+label. When the user requests changes, reply with the full revised outline.
 
 If the user attaches a template and lists its layout names, choose one per
 slide by adding '@layout: <name>' to the heading (e.g.

@@ -1,12 +1,13 @@
 """
 title: PowerPoint Template Primer
 author: openPPT
-version: 0.2.0
+version: 0.3.0
 requirements: python-pptx
-description: When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT outline format, and tells it to organize the content you provided into a logically flowing deck that fills those layouts. Pair it with the "Export to PowerPoint" action: attach a template, dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
+description: When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT outline format, and tells it to organize the content you provided into a logically flowing deck that fills those layouts. Without a template, it still primes deck/presentation requests with the same outline format and a content-quality bar. Pair it with the "Export to PowerPoint" action: dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
 """
 
 import io
+import re
 
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
@@ -14,6 +15,19 @@ from pydantic import BaseModel, Field
 
 # Marker so we never inject the primer twice into the same request.
 SENTINEL = "[openPPT template primer]"
+
+# Loose signal that the user is asking for a deck, used only when no
+# template is attached (template presence is signal enough on its own).
+_DECK_KEYWORDS_RE = re.compile(
+    r"\b(deck|presentation|slides?|slideshow|powerpoint|pptx)\b", re.IGNORECASE
+)
+
+_QUALITY_BAR = (
+    "Make every bullet concrete: one specific number, name, date, or action "
+    'verb — never a topic label. If a bullet could describe any project '
+    'unchanged ("Improved efficiency", "Key considerations"), replace it '
+    "with the real fact from the content, or cut it."
+)
 
 TITLE_TYPES = (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
 SUBTITLE_TYPES = (PP_PLACEHOLDER.SUBTITLE,)
@@ -61,7 +75,7 @@ def _layouts_from_bytes(data: bytes) -> list:
     return [_describe_layout(lay) for lay in prs.slide_layouts]
 
 
-def _primer(layout_lines: list) -> str:
+def _template_primer(layout_lines: list) -> str:
     layouts = "\n".join(layout_lines)
     return f"""{SENTINEL}
 The user attached a PowerPoint template and provided content to turn into a
@@ -89,6 +103,7 @@ Formatting rules:
 - Embed an image with a bullet '![alt](url)' when the content includes one.
 - Put tabular data in a Markdown '| col | col |' table instead of bullets.
 - Put commands or code in a ``` fence; it renders as a monospace box.
+- {_QUALITY_BAR}
 
 Choose a layout for each slide by adding '@layout: <name>' to its heading,
 using ONLY these layouts from the attached template:
@@ -97,11 +112,57 @@ using ONLY these layouts from the attached template:
 When the user later asks for changes, reply with the full revised outline."""
 
 
+def _no_template_primer() -> str:
+    return f"""{SENTINEL}
+The user asked for a deck or presentation. Build it FROM the content already
+in this conversation — reorganize, group, and condense it into slides that
+flow logically. Do not invent facts that aren't there.
+
+Respond with ONLY a Markdown outline in this exact format (no prose around it):
+
+# Deck Title
+## One-line subtitle
+
+# First Slide Title
+- Short bullet point
+- Another bullet point
+  - Sub-point (indent two spaces)
+Notes: extra detail for the speaker (optional, kept off the slide)
+
+Formatting rules:
+- Start every slide with '# '. The first slide (title + subtitle, no bullets)
+  is the title slide.
+- 3-6 bullets per content slide, each under ~12 words. Push detail into 'Notes:'.
+- Flow: title -> agenda/overview -> grouped sections -> summary/next steps.
+- Embed an image with a bullet '![alt](url)' when the content includes one.
+- Put tabular data in a Markdown '| col | col |' table instead of bullets.
+- Put commands or code in a ``` fence; it renders as a monospace box.
+- {_QUALITY_BAR}
+
+If this isn't a deck/presentation request, ignore this and answer normally.
+When the user later asks for changes, reply with the full revised outline."""
+
+
+def _primer(layout_lines: list = None) -> str:
+    return _template_primer(layout_lines) if layout_lines else _no_template_primer()
+
+
+def _looks_like_deck_request(messages: list) -> bool:
+    for m in reversed(messages or []):
+        if m.get("role") == "user":
+            return bool(_DECK_KEYWORDS_RE.search(m.get("content") or ""))
+    return False
+
+
 class Filter:
     class Valves(BaseModel):
         enabled: bool = Field(
             default=True,
             description="Prime the model whenever a .pptx/.potx template is attached.",
+        )
+        prime_without_template: bool = Field(
+            default=True,
+            description="Also prime deck/presentation requests when no template is attached, using a template-less primer.",
         )
         priority: int = Field(
             default=0, description="Filter execution priority (lower runs first)."
@@ -112,8 +173,10 @@ class Filter:
 
     def inlet(self, body: dict, __user__: dict = None) -> dict:
         """Before the model answers: if a template is attached, inject a system
-        message listing its layouts and the outline spec. Never raises — on any
-        problem it returns the request untouched so the chat is unaffected."""
+        message listing its layouts and the outline spec; otherwise, for a
+        deck/presentation request, inject the template-less version of the
+        same spec. Never raises — on any problem it returns the request
+        untouched so the chat is unaffected."""
         try:
             if not self.valves.enabled:
                 return body
@@ -125,14 +188,19 @@ class Filter:
                 return body  # already primed this request
 
             data = self._find_template_bytes(body)
-            if data is None:
+            if data is not None:
+                layout_lines = _layouts_from_bytes(data)
+                if not layout_lines:
+                    return body
+                content = _primer(layout_lines)
+            elif self.valves.prime_without_template and _looks_like_deck_request(
+                messages
+            ):
+                content = _primer()
+            else:
                 return body
 
-            layout_lines = _layouts_from_bytes(data)
-            if not layout_lines:
-                return body
-
-            primer = {"role": "system", "content": _primer(layout_lines)}
+            primer = {"role": "system", "content": content}
             # Sit right after an existing system prompt, else lead the messages.
             idx = 0
             for i, m in enumerate(messages):
