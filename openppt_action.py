@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.5.1
+version: 0.5.2
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -46,7 +46,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 
 def _strip_md(text: str) -> str:
@@ -664,8 +664,19 @@ class Action:
                     "an outline — a '# Slide Title' heading per slide, with '-' "
                     "bullets under it."
                 )
-                await notify(help_text, "warning")
-                await status(help_text, done=True)
+                # The toast/status is the only channel some deployments show —
+                # the appended chat block below can go unseen — so lead with the
+                # evidence, not the advice: the version proves the paste is
+                # current, and 0 chars read (vs. N) separates "the action was
+                # handed no text" from "the parser rejected real text".
+                head = re.sub(r"\s+", " ", content[:80]).strip()
+                toast = (
+                    f"openPPT {VERSION}: nothing slide-shaped here — read "
+                    f"{len(content)} chars from {len(messages)} messages; "
+                    f"starts: {head or '(empty)'}"
+                )
+                await notify(toast, "warning")
+                await status(toast, done=True)
                 # Toasts and the status line get truncated, so the detail goes in
                 # the chat. Written so parse_outline finds nothing in it: no '---'
                 # rule, no bullet list, no lone '**bold**' line — otherwise the

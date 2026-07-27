@@ -4,6 +4,7 @@ from pptx import Presentation
 
 from openppt_action import (
     APPENDIX_MARKER,
+    VERSION,
     _find_layout_by_name,
     _pick_outline,
     build_pptx,
@@ -522,6 +523,32 @@ def test_no_outline_diagnostic_is_not_itself_slide_shaped():
     # and once appended to the message, it is invisible to the next click
     appended = {"id": "m1", "role": "assistant", "content": "Sorry, I can't help with that." + posted}
     assert _pick_outline([appended], "m1") == "Sorry, I can't help with that."
+
+
+def test_no_outline_toast_carries_the_evidence():
+    """Some deployments surface only the toast — the appended chat block goes
+    unseen — so the toast itself has to say which paste ran and how much text
+    the action was actually handed. '0 chars' (the action got nothing) and
+    'N chars' (the parser rejected real text) are different root causes, and
+    without them in the toast there is no way to tell them apart remotely."""
+    for content, expect_chars in (("", 0), ("Sorry, I can't help with that.", 30)):
+        events, inserted = _run_action(False, content=content)
+        assert inserted == {}  # nothing was built
+        toasts = [
+            str(e["data"].get("content", "")) + str(e["data"].get("description", ""))
+            for e in events
+            if e["type"] in ("notification", "status")
+        ]
+        assert toasts, events
+        blob = " ".join(toasts)
+        assert VERSION in blob, blob  # a stale paste shows up here
+        assert f"read {expect_chars} chars" in blob, blob
+    # and the empty case names itself rather than trailing off into nothing
+    assert "(empty)" in blob or "(empty)" in " ".join(
+        str(e["data"].get("content", ""))
+        for e in _run_action(False, content="")[0]
+        if e["type"] == "notification"
+    )
 
 
 def test_action_appends_full_url_when_request_available():
