@@ -551,6 +551,28 @@ def test_no_outline_toast_carries_the_evidence():
     )
 
 
+def test_shape_separates_the_ways_content_goes_missing():
+    """'read 0 chars' has four causes needing four different fixes. _shape has
+    to tell them apart from the toast alone, with no access to the machine."""
+    from openppt_action import _shape
+
+    # list-shaped (multimodal) content — _pick_outline's isinstance guard
+    # turns this into "" and the outline is lost
+    assert "assistant:list(1)" in _shape(
+        [{"role": "assistant", "content": [{"type": "text", "text": "# Slide"}]}]
+    )
+    # genuinely empty content in the POST body
+    assert "assistant:str(0)" in _shape([{"role": "assistant", "content": ""}])
+    # no assistant role at all — candidates never gets an entry
+    assert _shape([{"role": "user", "content": "hi"}]) == "user:str(2)"
+    # content absent entirely
+    assert "assistant:NoneType(?)" in _shape([{"role": "assistant"}])
+    # and it never raises on junk, since it runs inside the failure path
+    assert _shape(None) == "(none)"
+    assert _shape([]) == "(none)"
+    assert "str!" in _shape(["not-a-dict"])
+
+
 def test_action_appends_full_url_when_request_available():
     events, inserted = _run_action(False, __request__=_FakeRequest())
     (file_id,) = inserted

@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.5.2
+version: 0.5.3
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -46,7 +46,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 
 def _strip_md(text: str) -> str:
@@ -595,6 +595,25 @@ def build_pptx(slides: list, template=None) -> bytes:
     return buf.getvalue()
 
 
+def _shape(messages: list) -> str:
+    """'user:str(21), assistant:list(2)' — role and content shape per message.
+
+    Read only when no outline was found, and the four ways that happens need
+    different fixes: content arriving as a list (multimodal), as an empty
+    string, under no assistant role at all, or already consumed by the
+    appendix strip. The character count alone can't tell them apart.
+    """
+    parts = []
+    for msg in (messages or [])[-4:]:
+        if not isinstance(msg, dict):
+            parts.append(f"{type(msg).__name__}!")
+            continue
+        body = msg.get("content")
+        size = len(body) if hasattr(body, "__len__") else "?"
+        parts.append(f"{msg.get('role', '?')}:{type(body).__name__}({size})")
+    return ", ".join(parts) or "(none)"
+
+
 def _pick_outline(messages: list, target=None) -> str:
     """Content to export: the clicked assistant message, else the newest one
     that actually holds an outline.
@@ -672,8 +691,8 @@ class Action:
                 head = re.sub(r"\s+", " ", content[:80]).strip()
                 toast = (
                     f"openPPT {VERSION}: nothing slide-shaped here — read "
-                    f"{len(content)} chars from {len(messages)} messages; "
-                    f"starts: {head or '(empty)'}"
+                    f"{len(content)} chars from {len(messages)} messages "
+                    f"[{_shape(messages)}]; starts: {head or '(empty)'}"
                 )
                 await notify(toast, "warning")
                 await status(toast, done=True)
