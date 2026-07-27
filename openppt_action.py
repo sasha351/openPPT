@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.5.3
+version: 0.6.0
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -46,7 +46,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.5.3"
+VERSION = "0.6.0"
 
 
 def _strip_md(text: str) -> str:
@@ -595,6 +595,25 @@ def build_pptx(slides: list, template=None) -> bytes:
     return buf.getvalue()
 
 
+def _chat_messages(chat) -> list:
+    """Messages out of a saved chat dict, oldest-first.
+
+    Open WebUI keeps the same conversation twice — a flat 'messages' list and
+    a 'history.messages' id->message map — and which one is populated varies
+    by version, so read whichever has content.
+    """
+    if not isinstance(chat, dict):
+        return []
+    flat = chat.get("messages")
+    if isinstance(flat, list) and flat:
+        return flat
+    history = chat.get("history")
+    hist = history.get("messages") if isinstance(history, dict) else None
+    if isinstance(hist, dict):
+        return list(hist.values())
+    return hist if isinstance(hist, list) else []
+
+
 def _shape(messages: list) -> str:
     """'user:str(21), assistant:list(2)' — role and content shape per message.
 
@@ -677,6 +696,20 @@ class Action:
             target = body.get("id")
             content = _pick_outline(messages, target)
             slides = parse_outline(content)
+            if not slides:
+                # The body's copy of the conversation is unreliable: some Open
+                # WebUI versions POST the action assistant messages whose
+                # 'content' is an empty string, so there is nothing to parse and
+                # every export fails while the chat plainly holds an outline.
+                # Fall back to the stored chat, which is also where the template
+                # has had to come from since v0.5.1. Only on failure, so a body
+                # that does carry the outline costs no extra lookup.
+                stored = _chat_messages(await self._saved_chat(body))
+                if stored:
+                    from_chat = _pick_outline(stored, target)
+                    slides = parse_outline(from_chat)
+                    if slides or not content:
+                        messages, content = stored, from_chat
             if not slides:
                 help_text = (
                     "openPPT: nothing slide-shaped in that message. Ask the model for "
@@ -826,6 +859,25 @@ class Action:
             await notify(msg, "error")
             await status(msg, done=True)
 
+    async def _saved_chat(self, body: dict):
+        """The stored chat dict behind this action, or None.
+
+        Open WebUI strips the action request body down hard before POSTing to
+        /api/chat/actions — it carries no 'files' at all, and on some versions
+        the assistant message's 'content' comes through empty too. The stored
+        chat is the only copy that reliably has both.
+        """
+        if not body.get("chat_id"):
+            return None
+        try:
+            from open_webui.models.chats import Chats
+
+            chat = await _maybe_await(Chats.get_chat_by_id(body["chat_id"]))
+            return getattr(chat, "chat", None)
+        except Exception as e:
+            print(f"[openPPT] chat lookup failed: {type(e).__name__}: {e}", flush=True)
+            return None
+
     async def _find_template(self, body: dict, __user__: dict):
         """Return template bytes from the most recent .pptx/.potx attached to
         the chat, or None.
@@ -848,21 +900,12 @@ class Action:
             dict — message attachments newest-first, then chat-level ones."""
             if not isinstance(container, dict):
                 return
-            messages = container.get("messages") or []
-            for msg in reversed(messages) if isinstance(messages, list) else []:
+            for msg in reversed(_chat_messages(container)):
                 if isinstance(msg, dict):
                     yield from _file_entries(msg.get("files"))
             yield from _file_entries(container.get("files"))
 
-        sources = [body]
-        if body.get("chat_id"):
-            try:
-                from open_webui.models.chats import Chats
-
-                chat = await _maybe_await(Chats.get_chat_by_id(body["chat_id"]))
-                sources.append(getattr(chat, "chat", None))
-            except Exception as e:
-                print(f"[openPPT] chat lookup failed: {type(e).__name__}: {e}", flush=True)
+        sources = [body, await self._saved_chat(body)]
 
         for fid, hint in (e for src in sources for e in file_ids(src)):
             try:

@@ -368,7 +368,8 @@ class _FakeRequest:
     base_url = "http://host.example/"
 
 
-def _run_action(async_api: bool, content: str = SAMPLE, __request__=None):
+def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
+                body_content=None, history=False):
     """Drive Action.action against stand-in Open WebUI Files/Storage modules.
 
     Open WebUI's Files API is sync in older versions and async in current ones,
@@ -421,15 +422,20 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None):
         def get_file(path):
             return path
 
+    stored_messages = [
+        {"id": "m0", "role": "user", "content": "deck please",
+         "files": [{"type": "file", "id": "f1", "name": "brand.pptx"}]},
+        {"id": "m1", "role": "assistant", "content": content},
+    ]
+
     class Chat:
-        # what Open WebUI persists: the attachment lives on the user message
-        chat = {
-            "messages": [
-                {"id": "m0", "role": "user", "content": "deck please",
-                 "files": [{"type": "file", "id": "f1", "name": "brand.pptx"}]},
-                {"id": "m1", "role": "assistant", "content": content},
-            ]
-        }
+        # what Open WebUI persists: the attachment lives on the user message.
+        # Some versions keep the flat list, others only the history id->msg map.
+        chat = (
+            {"history": {"messages": {m["id"]: m for m in stored_messages}}}
+            if history
+            else {"messages": stored_messages}
+        )
 
     class Chats:
         @staticmethod
@@ -468,7 +474,8 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None):
         "chat_id": "c1",
         "messages": [
             {"id": "m0", "role": "user", "content": "deck please"},
-            {"id": "m1", "role": "assistant", "content": content},
+            {"id": "m1", "role": "assistant",
+             "content": content if body_content is None else body_content},
         ],
     }
     sys.modules.update(fakes)
@@ -549,6 +556,38 @@ def test_no_outline_toast_carries_the_evidence():
         for e in _run_action(False, content="")[0]
         if e["type"] == "notification"
     )
+
+
+def test_outline_is_read_from_the_saved_chat_when_the_body_is_blank():
+    """Some Open WebUI versions POST the action a body whose assistant message
+    content is an empty string — the toast reported exactly
+    'read 0 chars from 2 messages [user:str(12), assistant:str(0)]'.
+    parse_outline is pure, so with no text there is nothing to parse and every
+    export fails on that deployment while an identical chat exports fine on a
+    version that populates the body. The outline has to come from the stored
+    chat, the same way v0.5.1 had to go there for the template.
+    """
+    for hist in (False, True):
+        events, inserted = _run_action(False, body_content="", history=hist)
+        blob = " ".join(
+            str(e["data"].get("description", "")) + str(e["data"].get("content", ""))
+            for e in events
+        )
+        assert "nothing slide-shaped" not in blob, blob
+        (file_id,) = inserted  # a real deck was built from the stored outline
+        assert inserted[file_id]["meta"]["size"] > 0
+        assert "on your template" in blob  # and the template still resolved
+
+    # the body still wins when it does carry the outline: no needless chat read
+    events, inserted = _run_action(False)
+    assert inserted and "nothing slide-shaped" not in " ".join(
+        str(e["data"].get("content", "")) for e in events
+    )
+    # and a genuinely outline-less chat still reports, rather than hanging on
+    # a fallback that can't help
+    events, inserted = _run_action(False, content="Sorry, I can't help.", body_content="")
+    assert inserted == {}
+    assert any("nothing slide-shaped" in str(e["data"].get("content", "")) for e in events)
 
 
 def test_shape_separates_the_ways_content_goes_missing():
