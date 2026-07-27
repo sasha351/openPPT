@@ -37,7 +37,7 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.4.0** afterwards.
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.5.0** afterwards.
 
 ## Outline format
 
@@ -72,6 +72,27 @@ Clicking **Export to PowerPoint** appends a download link to the message. If you
 Notes: mention the EU launch timeline if asked
 > or write the note as a blockquote
 ```
+
+**Tables:** consecutive `|`-delimited lines become a real PowerPoint table on that slide (the `|---|` alignment row is dropped). Bullets on the same slide keep the top of the content area and the table sits below them.
+
+```markdown
+# Q3 Numbers
+- Revenue held through the reorg
+
+| Region | Revenue | Growth |
+|--------|---------|--------|
+| EMEA   | 4.2     | 12%    |
+| APAC   | 3.1     | 30%    |
+```
+
+**Code blocks:** a ` ``` ` fence inside a slide is rendered in a monospace box, so `# comments` in the code aren't mistaken for slide headings. A fence that opens *before* the first slide is treated as a wrapper around the whole outline and parsed through — models wrap their answer in one whether or not you ask them to.
+
+````markdown
+# Deploy
+```bash
+make ship
+```
+````
 
 **Images:** a bullet written as `![alt text](url or path)` embeds that image on the slide instead of a text bullet. A slide made up entirely of image bullets keeps its title and drops the bullet list in favor of the image(s); images that fail to load (bad URL, network error) are silently skipped so the export never fails because of one broken link.
 
@@ -145,5 +166,7 @@ pip install python-pptx pydantic && python test_parser.py && python test_filter.
 v0.3 scope: title + bullet slides, speaker notes, images, **custom `.pptx`/`.potx` templates**, per-slide layout selection by name, and a **template primer Filter** that turns "attach a template + dump content" into a formatted deck automatically. Placeholder mapping is generic (resolved by placeholder type), so it works on any template's layouts.
 
 v0.3.1 adds a tolerant parser (most-frequent heading level, heading-less fallbacks, inline-markdown stripping, `> ` notes) and makes every outcome report via a toast and the server log instead of the suppressible status line.
+
+v0.5.0 renders **tables** and **code blocks**: `|`-delimited rows become a real PowerPoint table, a ``` fence becomes a monospace box, and a fence wrapping the whole outline (or a `# comment` inside one) no longer confuses the slide parser.
 
 v0.4.0 fixes exports that came out garbled: openPPT now ignores text it appended to a message itself (its own download link or diagnostic) instead of parsing it back into slides, falls back to the newest message that actually holds an outline when the clicked one arrives empty, and shrinks long titles and dense bullet lists to fit their placeholders instead of letting them overflow across the slide.

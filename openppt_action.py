@@ -1,9 +1,9 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.4.0
+version: 0.5.0
 requirements: python-pptx
-description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
+description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
 
 import inspect
@@ -13,9 +13,10 @@ import urllib.request
 import uuid
 
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import MSO_AUTO_SIZE
-from pptx.util import Pt
+from pptx.util import Emu, Pt
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
@@ -32,6 +33,8 @@ BOLD_ONLY_RE = re.compile(r"^\*\*(.+?)\*\*:?$")
 SEPARATOR_RE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
 QUOTE_RE = re.compile(r"^>\s*(.*)")
 BULLET_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.+)")
+# '|---|:--:|' alignment row of a Markdown table — dropped, it isn't data.
+TABLE_SEP_RE = re.compile(r"^:?-+:?$")
 LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 
 # Precedes anything openPPT appends to a chat message — the download link, the
@@ -43,7 +46,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def _strip_md(text: str) -> str:
@@ -52,7 +55,15 @@ def _strip_md(text: str) -> str:
 
 
 def _new_slide(title: str, layout: str = "") -> dict:
-    return {"title": title, "subtitle": "", "layout": layout, "notes": "", "bullets": []}
+    return {
+        "title": title,
+        "subtitle": "",
+        "layout": layout,
+        "notes": "",
+        "bullets": [],
+        "table": [],
+        "code": "",
+    }
 
 
 def _split_layout(title: str):
@@ -69,11 +80,22 @@ def _slide_level(lines) -> int:
     A deck written with '## ' slides and one '# ' deck title should not treat
     every '## ' as a bullet, which is what keying on '# ' alone does.
     """
-    counts = {}
+    counts, unfenced = {}, {}
+    fenced = False
     for raw in lines:
+        if raw.strip().startswith("```"):
+            fenced = not fenced
+            continue
         m = HEADING_RE.match(raw.strip())
         if m:
-            counts[len(m.group(1))] = counts.get(len(m.group(1)), 0) + 1
+            lvl = len(m.group(1))
+            counts[lvl] = counts.get(lvl, 0) + 1
+            if not fenced:
+                unfenced[lvl] = unfenced.get(lvl, 0) + 1
+    # '# comment' inside a code block is not a slide heading — but a model that
+    # wrapped its whole outline in one fence has no unfenced heading at all,
+    # and dropping them all would lose the deck.
+    counts = unfenced or counts
     if not counts:
         return 0
     top = max(counts.values())
@@ -95,7 +117,7 @@ CHROME_TYPES = (
 def parse_outline(markdown: str) -> list:
     """Parse a Markdown outline into slides.
 
-    Each slide is {"title", "subtitle", "layout", "notes",
+    Each slide is {"title", "subtitle", "layout", "notes", "table", "code",
     "bullets": [(level, text) | (level, {"image": url, "alt": alt})]}.
 
     '# Heading' starts a slide, '-'/'*'/'1.' lines are bullets (indent = nesting),
@@ -118,6 +140,12 @@ def parse_outline(markdown: str) -> list:
     speaker notes alongside 'Notes:'. Inline '**bold**', '`code`' and
     '[links](url)' are flattened to plain text.
 
+    '|'-delimited lines become a table on that slide (the '|---|' alignment
+    row is dropped), and a ``` fence becomes a code block rendered in a
+    monospace box. A fence opened before the first slide is treated as a
+    wrapper around the whole outline and parsed through, since models wrap
+    their answer in one whether or not you ask them to.
+
     Text before the first slide marker (chat prose) is ignored. Returns []
     if no slides found. Everything from the `APPENDIX_MARKER` line onward is
     ignored too, so re-exporting a message openPPT already appended to (a
@@ -131,6 +159,8 @@ def parse_outline(markdown: str) -> list:
     slides = []
     slide = None
     expect_title = False
+    in_fence = False
+    fence_slide = None
 
     def start(title, layout=""):
         nonlocal slide
@@ -141,7 +171,19 @@ def parse_outline(markdown: str) -> list:
         line = raw.strip()
         if line == APPENDIX_MARKER or line.startswith(("**openPPT v0.3", "\U0001F4CA [Download ")):
             break  # openPPT's own appended output — pre-0.4.0 versions had no marker
-        if not line or line.startswith("```"):
+        if line.startswith("```"):
+            if in_fence:
+                in_fence, fence_slide = False, None
+            else:
+                # A fence that opens before the first slide wraps the whole
+                # outline (models do this constantly despite being told not
+                # to) — keep parsing through it instead of eating the deck.
+                in_fence, fence_slide = True, slide
+            continue
+        if in_fence and fence_slide is not None:
+            fence_slide["code"] += raw + "\n"
+            continue
+        if not line:
             continue
 
         heading = HEADING_RE.match(line)
@@ -185,6 +227,12 @@ def parse_outline(markdown: str) -> list:
         layout_line = LAYOUT_LINE_RE.match(line)
         if layout_line:
             slide["layout"] = layout_line.group(1).strip()
+            continue
+
+        if line.startswith("|") and line.endswith("|") and line.count("|") > 1:
+            cells = [_strip_md(c) for c in line[1:-1].split("|")]
+            if not all(TABLE_SEP_RE.match(c) for c in cells if c):
+                slide["table"].append(cells)
             continue
 
         indent = len(raw) - len(raw.lstrip())
@@ -415,6 +463,64 @@ def _fill_bullets(text_frame, bullets) -> None:
         p.font.size = size
 
 
+def _content_rect(prs, slide):
+    """Box for extra content (table, code): the body placeholder's, or a
+    margin-inset box under the title when the layout has none."""
+    body = _body_placeholder(slide)
+    if body is not None:
+        return body, (body.left, body.top, body.width, body.height)
+    left = Emu(int(prs.slide_width * 0.08))
+    top = Emu(int(prs.slide_height * 0.28))
+    return None, (left, top, prs.slide_width - 2 * left, prs.slide_height - top - left)
+
+
+def _drop_shape(shape) -> None:
+    """Remove a shape (an unfilled placeholder renders as an empty prompt box)."""
+    shape._element.getparent().remove(shape._element)
+
+
+def _add_table(slide, rows, rect) -> None:
+    left, top, width, height = rect
+    cols = max(len(r) for r in rows)
+    table = slide.shapes.add_table(len(rows), cols, left, top, width, height).table
+    size = Pt(14 if len(rows) <= 6 else 11)
+    for r, row in enumerate(rows):
+        for c in range(cols):
+            cell = table.cell(r, c)
+            cell.text = row[c] if c < len(row) else ""
+            for p in cell.text_frame.paragraphs:
+                p.font.size = size
+
+
+def _add_code(slide, code, rect) -> None:
+    lines = code.rstrip().splitlines()
+    box = slide.shapes.add_textbox(*rect)
+    box.fill.solid()
+    box.fill.fore_color.rgb = RGBColor(0xF4, 0xF4, 0xF4)
+    tf = box.text_frame
+    tf.word_wrap = True
+    # Monospace and small: code lines don't wrap gracefully, so err narrow.
+    size = Pt(14 if len(lines) <= 10 else (11 if len(lines) <= 18 else 9))
+    for j, text in enumerate(lines):
+        p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+        p.text = text
+        p.font.name = "Consolas"
+        p.font.size = size
+
+
+def _split_rect(rect, fraction):
+    """Top `fraction` of a box, and the remainder below it, with a gutter."""
+    left, top, width, height = rect
+    gutter = Pt(8)
+    upper = int(height * fraction)
+    return (left, top, width, Emu(upper)), (
+        left,
+        Emu(top + upper + gutter),
+        width,
+        Emu(height - upper - gutter),
+    )
+
+
 def build_pptx(slides: list, template=None) -> bytes:
     """Build a .pptx from parsed slides.
 
@@ -429,8 +535,9 @@ def build_pptx(slides: list, template=None) -> bytes:
     for i, s in enumerate(slides):
         text_bullets = [(lvl, t) for lvl, t in s["bullets"] if isinstance(t, str)]
         image_bullets = [(lvl, t) for lvl, t in s["bullets"] if isinstance(t, dict)]
-        image_only = not text_bullets and image_bullets
-        is_title = i == 0 and not s["bullets"]
+        table, code = s.get("table") or [], (s.get("code") or "").strip()
+        image_only = not text_bullets and not table and not code and image_bullets
+        is_title = i == 0 and not s["bullets"] and not table and not code
 
         layout = _find_layout_by_name(prs, s.get("layout", ""))
         if layout is None:
@@ -445,10 +552,23 @@ def build_pptx(slides: list, template=None) -> bytes:
             if sub is not None:
                 sub.text = s["subtitle"]
 
-        if text_bullets:
-            body = _body_placeholder(ps)
-            if body is not None and body.has_text_frame:
-                _fill_bullets(body.text_frame, text_bullets)
+        body, rect = _content_rect(prs, ps)
+        if text_bullets and body is not None and body.has_text_frame:
+            _fill_bullets(body.text_frame, text_bullets)
+            if table or code:
+                # Bullets keep the top of the box, the table/code takes the rest.
+                top_rect, rect = _split_rect(rect, 0.45)
+                body.height = top_rect[3]
+        elif (table or code) and body is not None:
+            _drop_shape(body)  # nothing to put in it; don't render an empty box
+        if table and code:
+            table_rect, rect = _split_rect(rect, 0.5)
+        else:
+            table_rect = rect
+        if table:
+            _add_table(ps, table, table_rect)
+        if code:
+            _add_code(ps, code, rect)
 
         for _, img in image_bullets:
             data = _fetch_image(img["image"])

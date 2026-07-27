@@ -51,6 +51,8 @@ def test_parse_outline():
         "layout": "",
         "notes": "",
         "bullets": [],
+        "table": [],
+        "code": "",
     }
     assert slides[1]["bullets"] == [
         (0, "Launched EU region"),
@@ -285,6 +287,75 @@ def test_find_layout_by_name_is_fuzzy():
     assert _find_layout_by_name(prs, "section header").name == "Section Header"
     assert _find_layout_by_name(prs, "TWO CONTENT").name == "Two Content"
     assert _find_layout_by_name(prs, "nope") is None
+
+
+TABLE_OUTLINE = """# Q3 Numbers
+- revenue held
+
+| Region | Rev | Growth |
+|--------|----:|:------:|
+| EMEA   | 4.2 | 12% |
+| APAC   | 3.1 | 30% |
+"""
+
+
+def test_parse_table():
+    (slide,) = parse_outline(TABLE_OUTLINE)
+    assert slide["table"] == [
+        ["Region", "Rev", "Growth"],
+        ["EMEA", "4.2", "12%"],
+        ["APAC", "3.1", "30%"],
+    ]
+    assert slide["bullets"] == [(0, "revenue held")]  # the rows aren't bullets
+
+
+def test_build_renders_table():
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(TABLE_OUTLINE))))
+    (table,) = [s.table for s in out.slides[0].shapes if s.has_table]
+    assert len(table.rows) == 3 and len(table.columns) == 3
+    assert table.cell(2, 0).text == "APAC"
+
+
+def test_parse_code_fence():
+    (slide,) = parse_outline("# Deploy\n- one step\n\n```bash\nmake ship\nssh box\n```\n")
+    assert slide["code"] == "make ship\nssh box\n"
+    assert slide["bullets"] == [(0, "one step")]
+
+
+def test_build_renders_code_in_a_monospace_box():
+    outline = "# Deploy\n```python\nprint('hi')\n```\n"
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(outline))))
+    boxes = [
+        s for s in out.slides[0].shapes
+        if s.has_text_frame and "print('hi')" in s.text_frame.text
+    ]
+    (box,) = boxes
+    assert box.text_frame.paragraphs[0].font.name == "Consolas"
+    # the empty bullet placeholder is gone, not left as a "click to add" box
+    assert not [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
+
+
+def test_heading_inside_a_code_fence_is_not_a_slide():
+    slides = parse_outline("# Setup\n- run it\n\n```sh\n# install deps\npip install x\n```\n")
+    assert [s["title"] for s in slides] == ["Setup"]
+    assert slides[0]["code"] == "# install deps\npip install x\n"
+
+
+def test_outline_wrapped_in_a_fence_still_parses():
+    """Models wrap their whole answer in ``` whatever the prompt says; that
+    fence must not swallow the deck into one slide's code block."""
+    slides = parse_outline("Here you go:\n\n```markdown\n# One\n- a\n\n# Two\n- b\n```\n")
+    assert [s["title"] for s in slides] == ["One", "Two"]
+    assert all(not s["code"] for s in slides)
+
+
+def test_bullets_and_a_table_share_the_slide():
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(TABLE_OUTLINE))))
+    slide = out.slides[0]
+    (body,) = [p for p in slide.placeholders if p.placeholder_format.idx == 1]
+    (table,) = [s for s in slide.shapes if s.has_table]
+    assert "revenue held" in body.text_frame.text
+    assert table.top >= body.top + body.height  # table sits below the bullets
 
 
 def test_list_layouts_reports_names():

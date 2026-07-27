@@ -29,9 +29,12 @@ Hard rules:
 - The first slide is the title slide: "# Title" then "## Subtitle", and NO bullets.
 - Every other slide has 3-6 bullets, each under ~12 words. Push detail to "Notes:".
 - Bullets start with "- ". Never bold a slide title, never write "Slide 1:",
-  never use "---" separators, never wrap the outline in ``` fences.
+  never use "---" separators, never wrap the whole outline in ``` fences.
 - "Notes:" lines are optional and go after that slide's bullets.
 - Embed an image with a bullet: ![alt](https://url-or-path)
+- Tabular data goes in a Markdown "| col | col |" table, not in bullets.
+- Commands or code go in a ``` fence inside that slide; it renders as a
+  monospace box on the slide.
 - Build the deck FROM the uploaded content. Reorganize, group, and condense it.
   Do not invent facts that aren't in the sources.
 - Flow: title -> agenda -> grouped sections -> summary / next steps.

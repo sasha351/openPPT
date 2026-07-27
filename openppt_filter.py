@@ -1,7 +1,7 @@
 """
 title: PowerPoint Template Primer
 author: openPPT
-version: 0.1.0
+version: 0.2.0
 requirements: python-pptx
 description: When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT outline format, and tells it to organize the content you provided into a logically flowing deck that fills those layouts. Pair it with the "Export to PowerPoint" action: attach a template, dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
 """
@@ -87,6 +87,8 @@ Formatting rules:
 - Open a new topic with a divider slide, and lay out the deck so it flows:
   title → agenda/overview → grouped sections → summary/next steps.
 - Embed an image with a bullet '![alt](url)' when the content includes one.
+- Put tabular data in a Markdown '| col | col |' table instead of bullets.
+- Put commands or code in a ``` fence; it renders as a monospace box.
 
 Choose a layout for each slide by adding '@layout: <name>' to its heading,
 using ONLY these layouts from the attached template:
