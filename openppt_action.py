@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.6.0
+version: 0.6.1
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -46,7 +46,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 
 def _strip_md(text: str) -> str:
@@ -696,6 +696,7 @@ class Action:
             target = body.get("id")
             content = _pick_outline(messages, target)
             slides = parse_outline(content)
+            saved_chat = None
             if not slides:
                 # The body's copy of the conversation is unreliable: some Open
                 # WebUI versions POST the action assistant messages whose
@@ -704,28 +705,46 @@ class Action:
                 # Fall back to the stored chat, which is also where the template
                 # has had to come from since v0.5.1. Only on failure, so a body
                 # that does carry the outline costs no extra lookup.
-                stored = _chat_messages(await self._saved_chat(body))
+                saved_chat = await self._saved_chat(body)
+                stored = _chat_messages(saved_chat)
                 if stored:
                     from_chat = _pick_outline(stored, target)
                     slides = parse_outline(from_chat)
                     if slides or not content:
                         messages, content = stored, from_chat
             if not slides:
+                # Temporary Chats are never written to the Chats table, so the
+                # fallback above can never find one — and the live request body
+                # is the only copy left, which different Open WebUI versions
+                # populate with the assistant's text inconsistently (missing
+                # message, empty string) since it's unsaved.
+                temp_chat = bool(body.get("chat_id")) and saved_chat is None
                 help_text = (
                     "openPPT: nothing slide-shaped in that message. Ask the model for "
                     "an outline — a '# Slide Title' heading per slide, with '-' "
                     "bullets under it."
                 )
+                if temp_chat:
+                    help_text += (
+                        " This looks like a Temporary Chat — Open WebUI doesn't "
+                        "save those, so openPPT has no reliable copy of the reply "
+                        "to read. Turn off Temporary Chat and try again."
+                    )
                 # The toast/status is the only channel some deployments show —
                 # the appended chat block below can go unseen — so lead with the
                 # evidence, not the advice: the version proves the paste is
                 # current, and 0 chars read (vs. N) separates "the action was
-                # handed no text" from "the parser rejected real text".
+                # handed no text" from "the parser rejected real text". The
+                # Temporary Chat note is the one exception worth repeating here.
                 head = re.sub(r"\s+", " ", content[:80]).strip()
+                temp_chat_note = (
+                    "; looks like a Temporary Chat — turn it off and retry"
+                    if temp_chat else ""
+                )
                 toast = (
                     f"openPPT {VERSION}: nothing slide-shaped here — read "
                     f"{len(content)} chars from {len(messages)} messages "
-                    f"[{_shape(messages)}]; starts: {head or '(empty)'}"
+                    f"[{_shape(messages)}]; starts: {head or '(empty)'}{temp_chat_note}"
                 )
                 await notify(toast, "warning")
                 await status(toast, done=True)

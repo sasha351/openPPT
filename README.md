@@ -33,11 +33,11 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 > **Where does the deck show up?** Three places, so a version that ignores one still delivers: as an **attachment chip** under the message (click it to preview or download), as a **📊 Download link** appended to the message text, and as that same full URL repeated as plain text right after it — copy-pasteable even where neither the chip nor the markdown link renders. The same URL also goes to the success toast and the server log. It's a full `scheme://host/api/v1/files/<id>/content` URL when Open WebUI passes the request through to the Action; otherwise it falls back to the relative path, which you'd paste onto your Open WebUI host yourself.
 
-> **Button shows but clicking it seems to do nothing?** It always reports back two ways: a **toast** in the browser, and a line in the Open WebUI **server log** prefixed `[openPPT]`. The usual cause is a message with no slide markers, and the toast says so. Since v0.5.2 the toast leads with the evidence rather than advice — `read 0 chars from 2 messages [user:str(12), assistant:str(0)]` — so a report from a machine you can't reach still says which paste ran and how much text the action was handed. `0 chars` means the outline never reached the parser: some Open WebUI versions POST the action an assistant message whose `content` is empty, which v0.6.0 handles by reading the outline from the saved chat instead. Note that a model preset can suppress the status line under a message via its `status_updates` capability — that hides statuses only, never the toast or the log. (Before v0.3.1, openPPT reported *only* through statuses, so a suppressed status looked exactly like a dead button.) If openPPT reports no outline, it posts a short diagnostic under the message saying what it actually read; that diagnostic is deliberately not slide-shaped, so clicking export again re-reads your outline rather than exporting the error report (which is what v0.3.5 did).
+> **Button shows but clicking it seems to do nothing?** It always reports back two ways: a **toast** in the browser, and a line in the Open WebUI **server log** prefixed `[openPPT]`. The usual cause is a message with no slide markers, and the toast says so. Since v0.5.2 the toast leads with the evidence rather than advice — `read 0 chars from 2 messages [user:str(12), assistant:str(0)]` — so a report from a machine you can't reach still says which paste ran and how much text the action was handed. `0 chars` means the outline never reached the parser: some Open WebUI versions POST the action an assistant message whose `content` is empty, which v0.6.0 handles by reading the outline from the saved chat instead. If you're in a **Temporary Chat**, that fallback can't help — Temporary Chats are never written to Open WebUI's chat storage, so there is nothing to fall back to; v0.6.1 detects this (a `chat_id` present but no stored chat found) and says so directly in the toast — turn off Temporary Chat and retry. On some deployments the button can still fail to read the chat reliably even in a normal saved chat (an Open WebUI version/config quirk in how it POSTs the action request, not the outline format); if the toast keeps reporting `0 chars` with no clear cause, skip the button and use the [command-line converter](#no-working-export-button-convert-from-the-command-line) instead. Note that a model preset can suppress the status line under a message via its `status_updates` capability — that hides statuses only, never the toast or the log. (Before v0.3.1, openPPT reported *only* through statuses, so a suppressed status looked exactly like a dead button.) If openPPT reports no outline, it posts a short diagnostic under the message saying what it actually read; that diagnostic is deliberately not slide-shaped, so clicking export again re-reads your outline rather than exporting the error report (which is what v0.3.5 did).
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.6.0** afterwards.
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.6.1** afterwards.
 
 ## Outline format
 
@@ -160,6 +160,23 @@ slide by adding '@layout: <name>' to the heading (e.g.
 
 Chat until the outline looks right, then click **Export to PowerPoint**. Attach a `.pptx`/`.potx` template to the chat to give the deck your theme.
 
+## No working Export button? Convert from the command line
+
+[`outline_to_pptx.py`](outline_to_pptx.py) builds the same `.pptx` as the **Export to PowerPoint** button, but reads the outline from a file instead of the chat — so it sidesteps Open WebUI entirely and works even where the button can't reliably read the chat (locked-down deployments, Temporary Chats, or any of the other causes above). It reuses the same `parse_outline`/`build_pptx` code as the button, so it follows the [outline format](#outline-format) exactly.
+
+Requires only `python-pptx` (`pip install python-pptx`), and `openppt_action.py` in the same directory (or on your `PYTHONPATH`).
+
+Copy the model's outline out of the chat into a text file, then:
+
+```bash
+python outline_to_pptx.py outline.md                     # writes outline.pptx
+python outline_to_pptx.py outline.md -o deck.pptx         # choose the output name
+python outline_to_pptx.py outline.md -t brand.pptx        # build on a template, same as attaching one to the chat
+pbpaste | python outline_to_pptx.py -                      # read the outline from the clipboard/stdin instead of a file
+```
+
+If the outline doesn't parse (no `# Slide Title` headings found), it exits with an error instead of writing an empty deck.
+
 ## Development
 
 ```
@@ -173,3 +190,5 @@ v0.3.1 adds a tolerant parser (most-frequent heading level, heading-less fallbac
 v0.5.0 renders **tables** and **code blocks**: `|`-delimited rows become a real PowerPoint table, a ``` fence becomes a monospace box, and a fence wrapping the whole outline (or a `# comment` inside one) no longer confuses the slide parser.
 
 v0.4.0 fixes exports that came out garbled: openPPT now ignores text it appended to a message itself (its own download link or diagnostic) instead of parsing it back into slides, falls back to the newest message that actually holds an outline when the clicked one arrives empty, and shrinks long titles and dense bullet lists to fit their placeholders instead of letting them overflow across the slide.
+
+v0.6.1 names Temporary Chat as a likely cause when the stored-chat fallback finds nothing (a `chat_id` present but no chat in storage), in both the toast and the appended diagnostic. Also adds [`outline_to_pptx.py`](outline_to_pptx.py), a standalone command-line converter for deployments where the button can't read the chat reliably at all.
