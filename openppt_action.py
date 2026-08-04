@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.7.0
+version: 0.7.1
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -31,7 +31,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 
 def _new_slide(title: str, layout: str = "") -> dict:
@@ -829,7 +829,10 @@ class Action:
                 # is the only copy left, which different Open WebUI versions
                 # populate with the assistant's text inconsistently (missing
                 # message, empty string) since it's unsaved.
-                temp_chat = bool(body.get("chat_id")) and saved_chat is None
+                # No stored copy at all — whether the lookup missed or there was
+                # no chat_id to look up with. A missing chat_id is the strongest
+                # unsaved-chat signal there is, so it must not suppress the hint.
+                temp_chat = saved_chat is None
                 help_text = (
                     "openPPT: nothing slide-shaped in that message. Ask the model for "
                     "an outline — a '# Slide Title' heading per slide, with '-' "
@@ -855,7 +858,9 @@ class Action:
                 toast = (
                     f"openPPT {VERSION}: nothing slide-shaped here — read "
                     f"{len(content)} chars from {len(messages)} messages "
-                    f"[{_shape(messages)}]; starts: {head or '(empty)'}{temp_chat_note}"
+                    f"[{_shape(messages)}]; chat_id "
+                    f"{'present' if body.get('chat_id') else 'MISSING'}; "
+                    f"starts: {head or '(empty)'}{temp_chat_note}"
                 )
                 await notify(toast, "warning")
                 await status(toast, done=True)

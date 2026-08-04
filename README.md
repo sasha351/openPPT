@@ -37,7 +37,7 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.7.0** afterwards.
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.7.1** afterwards.
 
 ## Outline format
 
@@ -194,6 +194,8 @@ If the outline doesn't parse (no `<slide title="...">` elements found), it exits
 ```
 pip install python-pptx pydantic && python test_parser.py && python test_filter.py
 ```
+
+v0.7.1 fixes the no-outline diagnostic: it now reports whether the request carried a `chat_id` at all, and the "looks like a Temporary Chat" hint fires whenever no saved copy of the chat was found — including when the request has no `chat_id`, which is exactly the unsaved-chat case the old condition suppressed.
 
 v0.7.0 replaces the Markdown outline grammar with an HTML one: `<slide title="..." subtitle="..." layout="...">` per slide, `<ul>`/`<li>` bullets (nesting = a nested `<ul>`), `<notes>`, `<table>`/`<tr>`/`<td>`, `<pre><code>`, and `<img>`. It's parsed with Python's standard `html.parser` instead of regex heading-level guessing, so slide boundaries are unambiguous and malformed/unclosed tags degrade gracefully instead of losing content. The template primer's content-quality guidance is also expanded — beyond "make bullets concrete," it now asks the model to distill by theme, cap the deck to what the content supports, and push supporting detail into notes.
 
