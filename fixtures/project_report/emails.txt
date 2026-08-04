@@ -1,0 +1,115 @@
+From: Priya Nair <priya.nair@northwind.io>
+To: project-atlas@northwind.io
+Date: Mon, 3 Aug 2026 09:14
+Subject: Atlas Migration — kickoff notes
+
+Team,
+
+Recapping this morning's kickoff for the Atlas CRM migration (legacy FoxPro
+system -> Postgres + internal API). Goals:
+
+- Zero data loss on the customer/contact tables (last hard requirement from Legal)
+- Cutover before the Q4 renewal cycle starts (Oct 1)
+- Old system stays read-only for 90 days post-cutover as a rollback safety net
+
+Owners: Priya (PM), Dave (backend), Mei (data migration), Carlos (QA).
+First milestone: schema mapping doc, due Aug 14.
+
+— Priya
+
+----------------------------------------------------------------------
+
+From: Dave Ostrowski <dave.o@northwind.io>
+To: project-atlas@northwind.io
+Date: Wed, 5 Aug 2026 16:42
+Subject: RE: Atlas Migration — kickoff notes
+
+Quick flag: the FoxPro "notes" field is actually three overloaded columns
+mashed together with pipe delimiters depending on which decade the row was
+written in. Mei and I spent yesterday reverse-engineering the encoding.
+
+Decision: we're writing a normalization pass that splits this into
+structured fields where possible and dumps the rest into a free-text
+"legacy_notes" column rather than trying to fully parse 20 years of formats.
+Good enough beats perfect here — Carlos, flag this to QA as an accepted
+lossy transform, not a bug.
+
+— Dave
+
+----------------------------------------------------------------------
+
+From: Mei Lin <mei.lin@northwind.io>
+To: project-atlas@northwind.io
+Date: Fri, 7 Aug 2026 11:05
+Subject: Status: schema mapping ~70% done
+
+Status update ahead of Monday:
+
+- Customers table: mapped, migrated to staging, row counts match (48,213)
+- Contacts table: mapped, migrated, row counts match (61,900)
+- Orders table: in progress, blocked on the currency-field ambiguity below
+- Invoices: not started
+
+Risk: pre-2019 orders store amounts as raw floats with no currency code —
+finance confirms everything before 2019 was USD-only, so we're hardcoding
+that assumption for historical rows. New rows already have currency codes.
+
+ETA for full schema mapping doc: Aug 14 as planned, on track.
+
+— Mei
+
+----------------------------------------------------------------------
+
+From: Carlos Reyes <carlos.reyes@northwind.io>
+To: project-atlas@northwind.io
+Date: Tue, 11 Aug 2026 14:20
+Subject: QA pass on staging — one real bug
+
+Ran the reconciliation script against staging:
+
+- Customers/Contacts: clean, zero discrepancies
+- Orders: 14 rows failed migration silently (not the currency thing Mei
+  flagged, a separate off-by-one in the date parser for orders placed
+  during the Nov 2021 DST change). Filed ATLAS-142, assigning to Dave.
+- Everything else passed the row-count + checksum spot checks
+
+Not a blocker for the schema doc deadline but it does need to be fixed
+before we migrate the real Orders table, not just staging.
+
+— Carlos
+
+----------------------------------------------------------------------
+
+From: Dave Ostrowski <dave.o@northwind.io>
+To: project-atlas@northwind.io
+Date: Thu, 13 Aug 2026 10:03
+Subject: RE: QA pass on staging — one real bug
+
+Fixed ATLAS-142 — the DST transition was producing a naive datetime that
+compared wrong against the migration window filter. Re-ran against all 14
+rows plus the surrounding week as a sanity check, all clean now.
+
+Schema mapping doc going out today, on time.
+
+— Dave
+
+----------------------------------------------------------------------
+
+From: Priya Nair <priya.nair@northwind.io>
+To: project-atlas@northwind.io
+Date: Mon, 17 Aug 2026 09:30
+Subject: Milestone 1 done — next up
+
+Schema mapping doc is in, milestone 1 closed on schedule.
+
+Next milestone: full staging migration (Customers, Contacts, Orders,
+Invoices) with Carlos's reconciliation script green across the board.
+Target: Aug 28.
+
+Open risk carried forward: we still don't have a confirmed maintenance
+window from IT for the production cutover. I've pinged Sandra in
+Infrastructure twice this week, following up again today. If we don't have
+a window by Aug 24 it threatens the Oct 1 cutover date — will escalate to
+Raj if needed.
+
+— Priya
