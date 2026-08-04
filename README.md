@@ -1,6 +1,6 @@
 # openPPT
 
-Let any LLM in [Open WebUI](https://openwebui.com) create PowerPoint decks — including models with **no function calling** (Gemma, etc.). The model just writes a Markdown outline in chat; an **"Export to PowerPoint"** button under the message converts it to a downloadable `.pptx`.
+Let any LLM in [Open WebUI](https://openwebui.com) create PowerPoint decks — including models with **no function calling** (Gemma, etc.). The model just writes an HTML outline in chat; an **"Export to PowerPoint"** button under the message converts it to a downloadable `.pptx`.
 
 ## The workflow: template in, deck out
 
@@ -37,68 +37,73 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.6.1** afterwards.
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.7.0** afterwards.
 
 ## Outline format
 
-The button parses the assistant message it's clicked on:
+The button parses the assistant message it's clicked on. Each slide is a `<slide>` element:
 
-```markdown
-# Q3 Results            ← first slide with no bullets = title slide
-## Revenue up 12% YoY   ← its subtitle
+```html
+<slide title="Q3 Results" subtitle="Revenue up 12% YoY"></slide>
+<!-- no bullets, title + subtitle attributes = title slide -->
 
-# Key Wins              ← '#' starts a slide
-- Launched EU region    ← '-', '*', '+', '1.', '1)' bullets
-  - Best quarter ever   ← indent = nesting
+<slide title="Key Wins">           <!-- each <slide> starts a slide -->
+<ul>
+<li>Launched EU region</li>        <!-- <li> bullets -->
+<li>Churn down to 2.1%
+<ul><li>Best quarter ever</li></ul>  <!-- nested <ul> = nested bullet -->
+</li>
+</ul>
+</slide>
 ```
 
-Prose before the first `#` (e.g. "Here's your deck:") is ignored.
+Prose before the first `<slide>` (e.g. "Here's your deck:") is ignored.
 
-**The parser is tolerant**, because local models rarely stick to one format:
+**The parser is deliberately tolerant**, using Python's standard `html.parser` rather than a strict validator, because local models don't emit clean markup any more reliably than they emitted clean Markdown:
 
-- Slides start at whichever heading level is **most frequent**. A deck written with `## ` per slide works, and a lone `# ` above it becomes the deck title rather than a stray bullet.
-- With **no headings at all**, slides start at `Slide 3: Title` prefixes, lone `**Bold Title**` lines, or `---` separators.
-- Inline `**bold**`, `` `code` `` and `[links](url)` are flattened to plain text.
+- An unclosed `<slide>`, `<li>`, or `<p>` is auto-closed by whatever ends it (the next `<slide>`, or the end of the message) instead of losing the rest of the deck.
+- Bare text sitting directly inside `<slide>` — not wrapped in `<p>` or `<li>` — still becomes a bullet instead of being silently dropped.
+- Inline tags like `<b>`, `<code>`, and `<a href="...">` are flattened to plain text.
+- A ` ``` ` fence around the whole reply is unwrapped rather than swallowing the deck — models wrap their answer in one whether or not you ask them to.
 
-Known gap: a deck using **only** `---` separators loses its first section, since treating leading prose as a slide would turn every chat message into a deck. Give the first slide a heading or a `Slide 1:` prefix.
+Clicking **Export to PowerPoint** appends a download link to the message, right after an `<!-- openppt -->` comment. Re-clicking Export on that same message stops parsing dead at that comment — even if the model's own last `<slide>` was left unclosed — so your own download link never becomes a bogus trailing bullet.
 
-Clicking **Export to PowerPoint** appends a download link to the message. If you click it again on that same message, the parser stops at that appended link and ignores everything after it — so re-exporting never turns your own download link into a bogus trailing bullet.
+**Speaker notes:** a `<notes>` (or `<blockquote>`) element anywhere in a slide becomes that slide's speaker notes.
 
-**Speaker notes:** a line starting with `Notes:` — or a `> ` blockquote — anywhere in a slide after its heading becomes that slide's speaker notes.
-
-```markdown
-# Key Wins
-- Launched EU region
-Notes: mention the EU launch timeline if asked
-> or write the note as a blockquote
+```html
+<slide title="Key Wins">
+<li>Launched EU region</li>
+<notes>mention the EU launch timeline if asked</notes>
+</slide>
 ```
 
-**Tables:** consecutive `|`-delimited lines become a real PowerPoint table on that slide (the `|---|` alignment row is dropped). Bullets on the same slide keep the top of the content area and the table sits below them.
+**Tables:** a `<table>` of `<tr>` rows of `<td>`/`<th>` cells becomes a real PowerPoint table on that slide. Bullets on the same slide keep the top of the content area and the table sits below them.
 
-```markdown
-# Q3 Numbers
-- Revenue held through the reorg
-
-| Region | Revenue | Growth |
-|--------|---------|--------|
-| EMEA   | 4.2     | 12%    |
-| APAC   | 3.1     | 30%    |
+```html
+<slide title="Q3 Numbers">
+<p>Revenue held through the reorg</p>
+<table>
+<tr><th>Region</th><th>Revenue</th><th>Growth</th></tr>
+<tr><td>EMEA</td><td>4.2</td><td>12%</td></tr>
+<tr><td>APAC</td><td>3.1</td><td>30%</td></tr>
+</table>
+</slide>
 ```
 
-**Code blocks:** a ` ``` ` fence inside a slide is rendered in a monospace box, so `# comments` in the code aren't mistaken for slide headings. A fence that opens *before* the first slide is treated as a wrapper around the whole outline and parsed through — models wrap their answer in one whether or not you ask them to.
+**Code blocks:** `<pre><code>...</code></pre>` inside a slide is rendered in a monospace box. Escape literal `<`, `>`, and `&` in the code as `&lt;` `&gt;` `&amp;` so they aren't mistaken for markup — or use a ` ``` ` fence instead, which openPPT HTML-escapes for you automatically before parsing.
 
-````markdown
-# Deploy
-```bash
-make ship
-```
+````html
+<slide title="Deploy">
+<pre><code>make ship</code></pre>
+</slide>
 ````
 
-**Images:** a bullet written as `![alt text](url or path)` embeds that image on the slide instead of a text bullet. A slide made up entirely of image bullets keeps its title and drops the bullet list in favor of the image(s); images that fail to load (bad URL, network error) are silently skipped so the export never fails because of one broken link.
+**Images:** `<img src="url-or-path" alt="description">` — bare inside a slide, or inside an `<li>` — embeds that image instead of a text bullet. A slide made up entirely of image bullets keeps its title and drops the bullet list in favor of the image(s); images that fail to load (bad URL, network error) are silently skipped so the export never fails because of one broken link.
 
-```markdown
-# Team Photo
-- ![Team offsite](https://example.com/team.jpg)
+```html
+<slide title="Team Photo">
+<img src="https://example.com/team.jpg" alt="Team offsite">
+</slide>
 ```
 
 ## Templates: bring your own theme
@@ -107,15 +112,15 @@ Attach a `.pptx` or `.potx` file to the chat and click **Export to PowerPoint**.
 
 With the [Filter](#the-workflow-template-in-deck-out) installed, attaching the template also primes the model automatically: it's told your template's layout names and the outline format, then asked to organize whatever content you provided into a deck that flows. You don't have to describe the format or the layouts yourself — just drop in the template and your content.
 
-**Pick a layout per slide.** Name any layout from your template so the model controls the design of each slide — inline on the heading or on its own `Layout:` line (the Filter tells the model to do this for you):
+**Pick a layout per slide.** Name any layout from your template with the `layout="..."` attribute so the model controls the design of each slide (the Filter tells the model to do this for you):
 
-```markdown
-# Product Roadmap @layout: Section Header
+```html
+<slide title="Product Roadmap" layout="Section Header"></slide>
 
-# Q4 Priorities
-Layout: Two Content
-- Ship billing v2
-- Migrate to EU region
+<slide title="Q4 Priorities" layout="Two Content">
+<li>Ship billing v2</li>
+<li>Migrate to EU region</li>
+</slide>
 ```
 
 Names are matched case-insensitively (exact first, then a loose substring match), so `@layout: two content` finds **Two Content**. If no template is attached, or a name doesn't match, openPPT falls back to sensible defaults (a title-slide layout for the opening slide, a title-and-content layout for the rest) chosen by inspecting each layout's placeholders — so this works with any template, not just PowerPoint's built-in themes.
@@ -138,24 +143,31 @@ If you'd rather not rely on the Filter (or it's disabled), create a model preset
 
 ```
 You are a presentation builder. When the user asks for a presentation,
-respond ONLY with a Markdown outline in exactly this format:
+respond ONLY with an HTML outline in exactly this format:
 
-# Deck Title
-## One-line subtitle
+<slide title="Deck Title" subtitle="One-line subtitle"></slide>
 
-# First Slide Title
-- Short bullet point
-- Another bullet point
-  - Sub-point (indent two spaces)
+<slide title="First Slide Title">
+<ul>
+<li>Short bullet point</li>
+<li>Another bullet point
+<ul><li>Sub-point</li></ul>
+</li>
+</ul>
+</slide>
 
-Rules: start every slide with '# ', use 3-6 bullets per slide, keep
-bullets under 12 words, no prose outside the outline. Make every bullet
-concrete: one specific number, name, date, or action verb — never a topic
-label. When the user requests changes, reply with the full revised outline.
+Rules: every slide is a <slide title="..."> element, use 3-6 <li> bullets
+per slide, keep bullets under 12 words, no prose outside the outline. Make
+every bullet concrete: one specific number, name, date, or action verb —
+never a topic label. Distill the source material by theme rather than
+transcribing it in order, and size the deck to what the content actually
+supports. When the user requests changes, reply with the full revised
+outline.
 
 If the user attaches a template and lists its layout names, choose one per
-slide by adding '@layout: <name>' to the heading (e.g.
-'# Overview @layout: Section Header'). Use only names the user provided.
+slide with a layout="<name>" attribute (e.g.
+'<slide title="Overview" layout="Section Header">'). Use only names the
+user provided.
 ```
 
 Chat until the outline looks right, then click **Export to PowerPoint**. Attach a `.pptx`/`.potx` template to the chat to give the deck your theme.
@@ -169,19 +181,21 @@ Requires only `python-pptx` (`pip install python-pptx`), and `openppt_action.py`
 Copy the model's outline out of the chat into a text file, then:
 
 ```bash
-python outline_to_pptx.py outline.md                     # writes outline.pptx
-python outline_to_pptx.py outline.md -o deck.pptx         # choose the output name
-python outline_to_pptx.py outline.md -t brand.pptx        # build on a template, same as attaching one to the chat
-pbpaste | python outline_to_pptx.py -                      # read the outline from the clipboard/stdin instead of a file
+python outline_to_pptx.py outline.html                     # writes outline.pptx
+python outline_to_pptx.py outline.html -o deck.pptx         # choose the output name
+python outline_to_pptx.py outline.html -t brand.pptx        # build on a template, same as attaching one to the chat
+pbpaste | python outline_to_pptx.py -                       # read the outline from the clipboard/stdin instead of a file
 ```
 
-If the outline doesn't parse (no `# Slide Title` headings found), it exits with an error instead of writing an empty deck.
+If the outline doesn't parse (no `<slide title="...">` elements found), it exits with an error instead of writing an empty deck.
 
 ## Development
 
 ```
 pip install python-pptx pydantic && python test_parser.py && python test_filter.py
 ```
+
+v0.7.0 replaces the Markdown outline grammar with an HTML one: `<slide title="..." subtitle="..." layout="...">` per slide, `<ul>`/`<li>` bullets (nesting = a nested `<ul>`), `<notes>`, `<table>`/`<tr>`/`<td>`, `<pre><code>`, and `<img>`. It's parsed with Python's standard `html.parser` instead of regex heading-level guessing, so slide boundaries are unambiguous and malformed/unclosed tags degrade gracefully instead of losing content. The template primer's content-quality guidance is also expanded — beyond "make bullets concrete," it now asks the model to distill by theme, cap the deck to what the content supports, and push supporting detail into notes.
 
 v0.3 scope: title + bullet slides, speaker notes, images, **custom `.pptx`/`.potx` templates**, per-slide layout selection by name, and a **template primer Filter** that turns "attach a template + dump content" into a formatted deck automatically. Placeholder mapping is generic (resolved by placeholder type), so it works on any template's layouts.
 

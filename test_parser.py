@@ -14,32 +14,35 @@ from openppt_action import (
 
 SAMPLE = """Here's your deck:
 
-# Q3 Results
-## Revenue up 12% YoY
+<slide title="Q3 Results" subtitle="Revenue up 12% YoY"></slide>
 
-# Key Wins
-- Launched EU region
-- Churn down to 2.1%
-  - Best quarter ever
-Notes: mention the EU launch timeline if asked
+<slide title="Key Wins">
+<ul>
+<li>Launched EU region</li>
+<li>Churn down to 2.1%
+<ul><li>Best quarter ever</li></ul>
+</li>
+</ul>
+<notes>mention the EU launch timeline if asked</notes>
+</slide>
 
-# Next Quarter
-1. Ship mobile app
-* Hire 2 SREs
+<slide title="Next Quarter">
+<ol>
+<li>Ship mobile app</li>
+<li>Hire 2 SREs</li>
+</ol>
+</slide>
 
-# Team Photo
-- ![Team offsite](https://example.com/team.jpg)
+<slide title="Team Photo">
+<ul><li><img src="https://example.com/team.jpg" alt="Team offsite"></li></ul>
+</slide>
 """
 
-TEMPLATED = """# Roadmap @layout: Section Header
+TEMPLATED = """<slide title="Roadmap" layout="Section Header"></slide>
 
-# Details {layout: Two Content}
-- Point one
-- Point two
-
-# Plain slide
-Layout: Title and Content
-- A bullet
+<slide title="Details" layout="Two Content">
+<ul><li>Point one</li><li>Point two</li></ul>
+</slide>
 """
 
 
@@ -65,66 +68,76 @@ def test_parse_outline():
     assert slides[3]["bullets"] == [
         (0, {"alt": "Team offsite", "image": "https://example.com/team.jpg"})
     ]
-    assert parse_outline("no headings here") == []
+    assert parse_outline("no slide tags here") == []
 
 
-def test_parse_layout_directives():
+def test_parse_layout_attribute():
     slides = parse_outline(TEMPLATED)
-    # inline '@layout:', inline '{layout: ...}', and a standalone 'Layout:' line
     assert slides[0]["title"] == "Roadmap"
     assert slides[0]["layout"] == "Section Header"
     assert slides[1]["title"] == "Details"
     assert slides[1]["layout"] == "Two Content"
     assert slides[1]["bullets"] == [(0, "Point one"), (0, "Point two")]
-    assert slides[2]["title"] == "Plain slide"
-    assert slides[2]["layout"] == "Title and Content"
-    assert slides[2]["bullets"] == [(0, "A bullet")]
 
 
-def test_h2_deck_slides_on_most_common_level():
-    """A '## '-per-slide deck: '#' above it is the deck title, not a bullet."""
-    slides = parse_outline("# Deck\n## One\n- a\n## Two\n- b\n## Three\n- c\n")
-    assert [s["title"] for s in slides] == ["Deck", "One", "Two", "Three"]
-    assert slides[1]["bullets"] == [(0, "a")]
+def test_subtitle_attribute_works_on_any_slide():
+    slides = parse_outline(
+        '<slide title="A" subtitle="first"></slide><slide title="B" subtitle="second"><li>x</li></slide>'
+    )
+    assert slides[0]["subtitle"] == "first"
+    assert slides[1]["subtitle"] == "second"
+    assert slides[1]["bullets"] == [(0, "x")]
 
 
-def test_headingless_fallbacks():
-    assert [s["title"] for s in parse_outline("Slide 1: Intro\n- a\nSlide 2: Body\n- b\n")] == [
-        "Intro",
-        "Body",
-    ]
-    assert [s["title"] for s in parse_outline("**Intro**\n- a\n\n**Body**\n- b\n")] == [
-        "Intro",
-        "Body",
-    ]
-    sep = parse_outline("Intro\n- a\n\n---\n\nBody\n- b\n")
-    assert [s["title"] for s in sep] == ["Body"]  # prose before the first marker is dropped
-    assert sep[0]["bullets"] == [(0, "b")]
+def test_unclosed_slide_tags_are_tolerated():
+    """A model that forgets '</slide>' shouldn't lose the next slide."""
+    slides = parse_outline(
+        '<slide title="One"><li>a<slide title="Two"><li>b</slide>'
+    )
+    assert [s["title"] for s in slides] == ["One", "Two"]
+    assert slides[0]["bullets"] == [(0, "a")]
+    assert slides[1]["bullets"] == [(0, "b")]
 
 
-def test_extra_bullet_markers_and_inline_markdown():
-    (slide,) = parse_outline("# T\n+ plus\n2) paren\n- **bold** `code` [link](http://x)\n")
-    assert slide["bullets"] == [
-        (0, "plus"),
-        (0, "paren"),
-        (0, "bold code link"),
-    ]
+def test_bare_text_inside_slide_becomes_a_bullet():
+    """Text not wrapped in '<p>'/'<li>' shouldn't be silently dropped."""
+    (slide,) = parse_outline('<slide title="Bare">Just some text</slide>')
+    assert slide["bullets"] == [(0, "Just some text")]
 
 
-def test_blockquote_notes():
-    (slide,) = parse_outline("# T\n- a\n> quoted note\nNotes: and this\n")
+def test_p_tag_is_a_bullet():
+    (slide,) = parse_outline(
+        '<slide title="T"><p>First paragraph</p><p>Second paragraph</p></slide>'
+    )
+    assert slide["bullets"] == [(0, "First paragraph"), (0, "Second paragraph")]
+
+
+def test_inline_tags_flatten_to_plain_text():
+    (slide,) = parse_outline(
+        '<slide title="T"><ul><li><b>bold</b> <code>code</code> '
+        '<a href="http://x">link</a></li></ul></slide>'
+    )
+    assert slide["bullets"] == [(0, "bold code link")]
+
+
+def test_notes_and_blockquote_both_feed_notes():
+    (slide,) = parse_outline(
+        '<slide title="T"><li>a</li><blockquote>quoted note</blockquote>'
+        "<notes>and this</notes></slide>"
+    )
     assert slide["notes"] == "quoted note\nand this"
     assert slide["bullets"] == [(0, "a")]
 
 
-def test_tolerance_does_not_break_layouts_or_images():
-    """New grammar must not eat the v0.3.0 directives it runs alongside."""
-    slides = parse_outline(
-        "## Roadmap @layout: Section Header\n## Photo\n- ![alt](http://x/y.png)\n"
-    )
-    assert slides[0]["layout"] == "Section Header"
-    assert slides[0]["title"] == "Roadmap"
-    assert slides[1]["bullets"] == [(0, {"alt": "alt", "image": "http://x/y.png"})]
+def test_deeply_nested_bullets_cap_at_level_4():
+    nested = "<slide title=\"T\">"
+    for _ in range(7):
+        nested += "<ul><li>"
+    nested += "deep"
+    nested += "</li></ul>" * 7
+    nested += "</slide>"
+    (slide,) = parse_outline(nested)
+    assert slide["bullets"] == [(4, "deep")]
 
 
 def test_ignores_appended_download_link():
@@ -135,47 +148,31 @@ def test_ignores_appended_download_link():
         + f"\n{APPENDIX_MARKER}\n📊 [Download deck.pptx](/api/v1/files/abc/content)"
         + "\n\nhttp://host/api/v1/files/abc/content\n"
     )
-    slides = parse_outline(appended)
-    assert slides == parse_outline(SAMPLE)
+    assert parse_outline(appended) == parse_outline(SAMPLE)
 
 
-def test_legacy_pre_0_4_0_appendix_is_not_parsed():
-    """Versions before 0.4.0 appended openPPT's own output with no marker at
-    all, so parse_outline has no APPENDIX_MARKER line to break on. A real
-    v0.3.5 diagnostic looked like this — and used to parse into a slide
-    titled 'openPPT v0.3.5 diagnostic — ...' with its bullets under it."""
-    legacy_diagnostic = (
-        "\n\n---\n**openPPT v0.3.5 diagnostic** — openPPT: nothing "
-        "slide-shaped in that message.\n\n- messages in request: 2\n"
-        "- body id: `abc`\n\nWhat it parsed:\n\n```\n(empty)\n```\n"
-    )
-    assert parse_outline(legacy_diagnostic) == []
-
-    legacy_download = "\n\n📊 [Download deck.pptx](/api/v1/files/x/content)"
-    assert parse_outline(legacy_download) == []
-
-    # The realistic composite case: export succeeded (so the message already
-    # had a real outline) and the user re-clicks, appending the legacy
-    # (marker-less) download link to it. Parses to exactly the same slides.
-    assert parse_outline(SAMPLE + legacy_download) == parse_outline(SAMPLE)
-
-    # A legacy diagnostic never actually lands next to a real outline in
-    # production — it only gets appended when parse_outline found nothing —
-    # but as a parser-robustness check: appending it after a real outline
-    # still creates no extra slide and leaks none of the diagnostic's prose.
-    # One harmless artifact remains: the diagnostic's own leading '---' isn't
-    # part of the break-trigger set (bare '---' is meaningful elsewhere, as a
-    # slide separator in headingless decks — see test_headingless_fallbacks),
-    # so it lands as a literal trailing bullet on the deck's last slide.
-    combined = parse_outline(SAMPLE + legacy_diagnostic)
-    base = parse_outline(SAMPLE)
-    assert [s["title"] for s in combined] == [s["title"] for s in base]
-    assert combined[-1]["bullets"] == base[-1]["bullets"] + [(0, "---")]
+def test_appendix_marker_stops_even_with_an_unclosed_slide():
+    """The marker has to win even when the model's own last slide was never
+    closed — otherwise openPPT's own appended text gets folded into it."""
+    unclosed = '<slide title="Real"><li>x' + f"\n\n{APPENDIX_MARKER}\n<slide title=\"stray\"><li>y</slide>"
+    slides = parse_outline(unclosed)
+    assert len(slides) == 1
+    assert slides[0]["title"] == "Real"
+    assert slides[0]["bullets"] == [(0, "x")]
 
 
 def test_never_raises():
-    for junk in ["", "\x00�🙂" * 100, "#" * 500, "- \n" * 5000, "```\nunclosed"]:
-        assert isinstance(parse_outline(junk), list)
+    junk = [
+        "",
+        "\x00�🙂" * 100,
+        "<" * 500,
+        "<li>" * 5000,
+        "<pre>\nunclosed",
+        "<slide title='" + "x" * 2000,
+        "```\nunclosed fence",
+    ]
+    for j in junk:
+        assert isinstance(parse_outline(j), list)
 
 
 def test_pick_outline_falls_back_when_the_clicked_message_is_empty():
@@ -213,8 +210,9 @@ def test_build_pptx():
 
 
 def test_build_pptx_skips_unreachable_image():
-    # image slide with an unfetchable URL should still produce a valid deck
-    slides = parse_outline("# Photo\n- ![x](https://nonexistent.invalid/x.png)\n")
+    slides = parse_outline(
+        '<slide title="Photo"><li><img src="https://nonexistent.invalid/x.png" alt="x"></li></slide>'
+    )
     data = build_pptx(slides)
     assert data[:2] == b"PK"
 
@@ -240,14 +238,14 @@ def test_build_with_template_clears_sample_slides():
 
 def test_layout_directive_selects_named_layout():
     template = _make_template_bytes()
-    slides = parse_outline("# Roadmap @layout: Section Header\n- item\n")
+    slides = parse_outline('<slide title="Roadmap" layout="Section Header"><li>item</li></slide>')
     data = build_pptx(slides, template=template)
     out = Presentation(io.BytesIO(data))
     assert out.slides[0].slide_layout.name == "Section Header"
 
 
 def test_body_bullets_land_in_a_placeholder():
-    slides = parse_outline("# Ideas\n- first\n- second\n")
+    slides = parse_outline('<slide title="Ideas"><ul><li>first</li><li>second</li></ul></slide>')
     data = build_pptx(slides)
     out = Presentation(io.BytesIO(data))
     texts = [
@@ -263,21 +261,27 @@ def test_long_title_shrinks_instead_of_overlapping_the_body():
     """python-pptx can't recompute PowerPoint's autofit, so a long title keeps
     the template's ~44pt and spills across the slide over the bullets."""
     long_title = "openPPT: nothing slide-shaped in that message. " * 4
-    out = Presentation(io.BytesIO(build_pptx(parse_outline(f"# {long_title}\n- a\n"))))
+    out = Presentation(
+        io.BytesIO(build_pptx(parse_outline(f'<slide title="{long_title}"><li>a</li></slide>')))
+    )
     frame = out.slides[0].shapes.title.text_frame
     assert frame.word_wrap is True
     assert frame.paragraphs[0].font.size.pt <= 20
 
 
 def test_short_title_keeps_the_templates_own_size():
-    out = Presentation(io.BytesIO(build_pptx(parse_outline("# Q3 Results\n- a\n"))))
+    out = Presentation(
+        io.BytesIO(build_pptx(parse_outline('<slide title="Q3 Results"><li>a</li></slide>')))
+    )
     # None = inherited from the layout; we must not restyle a title that fits
     assert out.slides[0].shapes.title.text_frame.paragraphs[0].font.size is None
 
 
 def test_dense_bullet_list_shrinks():
-    outline = "# Ideas\n" + "".join(f"- point {i}\n" for i in range(14))
-    out = Presentation(io.BytesIO(build_pptx(parse_outline(outline))))
+    items = "".join(f"<li>point {i}</li>" for i in range(14))
+    out = Presentation(
+        io.BytesIO(build_pptx(parse_outline(f'<slide title="Ideas"><ul>{items}</ul></slide>')))
+    )
     (body,) = [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
     assert len(body.text_frame.paragraphs) == 14
     assert all(p.font.size.pt <= 14 for p in body.text_frame.paragraphs)
@@ -290,13 +294,14 @@ def test_find_layout_by_name_is_fuzzy():
     assert _find_layout_by_name(prs, "nope") is None
 
 
-TABLE_OUTLINE = """# Q3 Numbers
-- revenue held
-
-| Region | Rev | Growth |
-|--------|----:|:------:|
-| EMEA   | 4.2 | 12% |
-| APAC   | 3.1 | 30% |
+TABLE_OUTLINE = """<slide title="Q3 Numbers">
+<p>revenue held</p>
+<table>
+<tr><th>Region</th><th>Rev</th><th>Growth</th></tr>
+<tr><td>EMEA</td><td>4.2</td><td>12%</td></tr>
+<tr><td>APAC</td><td>3.1</td><td>30%</td></tr>
+</table>
+</slide>
 """
 
 
@@ -317,14 +322,32 @@ def test_build_renders_table():
     assert table.cell(2, 0).text == "APAC"
 
 
-def test_parse_code_fence():
-    (slide,) = parse_outline("# Deploy\n- one step\n\n```bash\nmake ship\nssh box\n```\n")
-    assert slide["code"] == "make ship\nssh box\n"
+def test_parse_pre_code_block():
+    (slide,) = parse_outline(
+        '<slide title="Deploy"><li>one step</li><pre><code>make ship\nssh box</code></pre></slide>'
+    )
+    assert slide["code"] == "make ship\nssh box"
     assert slide["bullets"] == [(0, "one step")]
 
 
+def test_parse_fenced_code_block_inside_a_slide():
+    """Models fall back to ``` out of habit even when told to write HTML."""
+    (slide,) = parse_outline('<slide title="Deploy">\n```bash\nmake ship\nssh box\n```\n</slide>')
+    assert slide["code"] == "make ship\nssh box"
+
+
+def test_code_with_angle_brackets_does_not_confuse_the_parser():
+    """A ``` fence is HTML-escaped before parsing, so code containing '<'/'>'
+    (e.g. a real HTML/XML sample) can't be mistaken for slide markup."""
+    (slide,) = parse_outline(
+        '<slide title="XML">\n```xml\n<a href="x"><b>hi</b></a>\n```\n</slide>'
+    )
+    assert slide["code"] == '<a href="x"><b>hi</b></a>'
+    assert slide["bullets"] == []
+
+
 def test_build_renders_code_in_a_monospace_box():
-    outline = "# Deploy\n```python\nprint('hi')\n```\n"
+    outline = '<slide title="Deploy"><pre><code>print(\'hi\')</code></pre></slide>'
     out = Presentation(io.BytesIO(build_pptx(parse_outline(outline))))
     boxes = [
         s for s in out.slides[0].shapes
@@ -336,16 +359,13 @@ def test_build_renders_code_in_a_monospace_box():
     assert not [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
 
 
-def test_heading_inside_a_code_fence_is_not_a_slide():
-    slides = parse_outline("# Setup\n- run it\n\n```sh\n# install deps\npip install x\n```\n")
-    assert [s["title"] for s in slides] == ["Setup"]
-    assert slides[0]["code"] == "# install deps\npip install x\n"
-
-
 def test_outline_wrapped_in_a_fence_still_parses():
     """Models wrap their whole answer in ``` whatever the prompt says; that
     fence must not swallow the deck into one slide's code block."""
-    slides = parse_outline("Here you go:\n\n```markdown\n# One\n- a\n\n# Two\n- b\n```\n")
+    slides = parse_outline(
+        'Here you go:\n\n```html\n<slide title="One"><li>a</li></slide>\n'
+        '<slide title="Two"><li>b</li></slide>\n```\n'
+    )
     assert [s["title"] for s in slides] == ["One", "Two"]
     assert all(not s["code"] for s in slides)
 
@@ -518,14 +538,13 @@ def test_action_inserts_the_file_and_links_to_it():
 
 def test_no_outline_diagnostic_is_not_itself_slide_shaped():
     """v0.3.5 posted an error report written in '---' + '- ' Markdown, so the
-    next click exported the error report as a deck."""
+    next click exported the error report as a deck — the diagnostic must
+    still contain no '<slide>' tag under the new grammar."""
     events, inserted = _run_action(False, content="Sorry, I can't help with that.")
     assert inserted == {}  # nothing was built
     (message,) = [e for e in events if e["type"] == "message"]
     posted = message["data"]["content"]
     assert APPENDIX_MARKER in posted
-    # the marker-strip in parse_outline would make this pass for any body at
-    # all — assert on the diagnostic's own prose, after the marker, instead
     assert parse_outline(posted.split(APPENDIX_MARKER, 1)[1]) == []
     # and once appended to the message, it is invisible to the next click
     appended = {"id": "m1", "role": "assistant", "content": "Sorry, I can't help with that." + posted}
@@ -598,7 +617,7 @@ def test_shape_separates_the_ways_content_goes_missing():
     # list-shaped (multimodal) content — _pick_outline's isinstance guard
     # turns this into "" and the outline is lost
     assert "assistant:list(1)" in _shape(
-        [{"role": "assistant", "content": [{"type": "text", "text": "# Slide"}]}]
+        [{"role": "assistant", "content": [{"type": "text", "text": "<slide>"}]}]
     )
     # genuinely empty content in the POST body
     assert "assistant:str(0)" in _shape([{"role": "assistant", "content": ""}])

@@ -1,9 +1,9 @@
 """
 title: PowerPoint Template Primer
 author: openPPT
-version: 0.3.0
+version: 0.4.0
 requirements: python-pptx
-description: When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT outline format, and tells it to organize the content you provided into a logically flowing deck that fills those layouts. Without a template, it still primes deck/presentation requests with the same outline format and a content-quality bar. Pair it with the "Export to PowerPoint" action: dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
+description: When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT HTML outline format, and tells it to distill the content you provided into a logically flowing deck that fills those layouts. Without a template, it still primes deck/presentation requests with the same outline format and a content-quality bar. Pair it with the "Export to PowerPoint" action: dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
 """
 
 import io
@@ -22,12 +22,22 @@ _DECK_KEYWORDS_RE = re.compile(
     r"\b(deck|presentation|slides?|slideshow|powerpoint|pptx)\b", re.IGNORECASE
 )
 
-_QUALITY_BAR = (
-    "Make every bullet concrete: one specific number, name, date, or action "
-    'verb — never a topic label. If a bullet could describe any project '
-    'unchanged ("Improved efficiency", "Key considerations"), replace it '
-    "with the real fact from the content, or cut it."
-)
+_QUALITY_BAR = """- Make every bullet concrete: one specific number, name, date, or action verb
+  — never a topic label. If a bullet could describe any project unchanged
+  ("Improved efficiency", "Key considerations"), replace it with the real
+  fact from the content, or cut it.
+- Give each slide exactly one point a viewer takes away, not a paragraph
+  chopped into fragments. If two bullets are making the same point, merge
+  them or cut one.
+- Group by theme, not by the source's paragraph order — pull related facts
+  together even if they were scattered across the input, and drop anything
+  restating a point already made on an earlier slide.
+- Size the deck to how much the content actually supports: a short input
+  makes a short deck. Padding it out with filler slides ("Overview",
+  "Conclusion") that add no new information is worse than a shorter deck.
+- Push supporting detail, caveats, and sourcing into that slide's notes
+  instead of cramming them onto the slide — the slide is the headline, the
+  notes are the explanation."""
 
 TITLE_TYPES = (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
 SUBTITLE_TYPES = (PP_PLACEHOLDER.SUBTITLE,)
@@ -75,38 +85,51 @@ def _layouts_from_bytes(data: bytes) -> list:
     return [_describe_layout(lay) for lay in prs.slide_layouts]
 
 
+_FORMAT_RULES = """- Wrap every slide in <slide title="...">...</slide>. The first slide has
+  only title and subtitle attributes, no body — that's the title slide.
+- 3-6 <li> bullets per content slide, each under ~12 words. Nest a <ul> inside
+  an <li> for a sub-point.
+- Embed an image in place of a bullet: <img src="url" alt="description">.
+- Put tabular data in <table><tr><td>...</td></tr></table>, not bullets.
+- Put commands or code in <pre><code>...</code></pre>; it renders as a
+  monospace box. Escape literal <, > and & in any text (as &lt; &gt; &amp;)
+  so it can't be mistaken for markup.
+- Respond with ONLY the <slide> elements — no prose before, after, or between
+  them, and no ```html fence wrapping them."""
+
+
 def _template_primer(layout_lines: list) -> str:
     layouts = "\n".join(layout_lines)
     return f"""{SENTINEL}
 The user attached a PowerPoint template and provided content to turn into a
-presentation. Build the deck FROM the content they gave you — reorganize,
-group, and summarize it into slides that flow logically. Do not invent facts
-that aren't in their content; you may condense and rephrase.
+presentation. Distill the content they gave you into a deck — pull out the
+substance, group it by theme, and cut anything that doesn't earn its place.
+Do not invent facts that aren't in their content; you may condense and
+rephrase.
 
-Respond with ONLY a Markdown outline in this exact format (no prose around it):
+Respond with ONLY an HTML outline in this exact format (no prose around it):
 
-# Deck Title
-## One-line subtitle
+<slide title="Deck Title" subtitle="One-line subtitle"></slide>
 
-# First Slide Title @layout: <layout name>
-- Short bullet point
-- Another bullet point
-  - Sub-point (indent two spaces)
-Notes: extra detail for the speaker (optional, kept off the slide)
+<slide title="First Slide Title" layout="<layout name>">
+<ul>
+<li>Short bullet point</li>
+<li>Another bullet point
+<ul><li>Sub-point</li></ul>
+</li>
+</ul>
+<notes>extra detail for the speaker (optional, kept off the slide)</notes>
+</slide>
 
 Formatting rules:
-- Start every slide with '# '. The first slide (title + subtitle, no bullets)
-  is the title slide.
-- 3-6 bullets per content slide, each under ~12 words. Push detail into 'Notes:'.
-- Open a new topic with a divider slide, and lay out the deck so it flows:
-  title → agenda/overview → grouped sections → summary/next steps.
-- Embed an image with a bullet '![alt](url)' when the content includes one.
-- Put tabular data in a Markdown '| col | col |' table instead of bullets.
-- Put commands or code in a ``` fence; it renders as a monospace box.
-- {_QUALITY_BAR}
+{_FORMAT_RULES}
+- Open a new topic with a divider slide (layout with a title and nothing
+  else), and lay out the deck so it flows: title → agenda/overview → grouped
+  sections → summary/next steps.
+{_QUALITY_BAR}
 
-Choose a layout for each slide by adding '@layout: <name>' to its heading,
-using ONLY these layouts from the attached template:
+Choose a layout for each slide with the layout="<name>" attribute, using ONLY
+these layouts from the attached template:
 {layouts}
 
 When the user later asks for changes, reply with the full revised outline."""
@@ -114,30 +137,29 @@ When the user later asks for changes, reply with the full revised outline."""
 
 def _no_template_primer() -> str:
     return f"""{SENTINEL}
-The user asked for a deck or presentation. Build it FROM the content already
-in this conversation — reorganize, group, and condense it into slides that
-flow logically. Do not invent facts that aren't there.
+The user asked for a deck or presentation. Distill the content already in
+this conversation into a deck — pull out the substance, group it by theme,
+and cut anything that doesn't earn its place. Do not invent facts that
+aren't there.
 
-Respond with ONLY a Markdown outline in this exact format (no prose around it):
+Respond with ONLY an HTML outline in this exact format (no prose around it):
 
-# Deck Title
-## One-line subtitle
+<slide title="Deck Title" subtitle="One-line subtitle"></slide>
 
-# First Slide Title
-- Short bullet point
-- Another bullet point
-  - Sub-point (indent two spaces)
-Notes: extra detail for the speaker (optional, kept off the slide)
+<slide title="First Slide Title">
+<ul>
+<li>Short bullet point</li>
+<li>Another bullet point
+<ul><li>Sub-point</li></ul>
+</li>
+</ul>
+<notes>extra detail for the speaker (optional, kept off the slide)</notes>
+</slide>
 
 Formatting rules:
-- Start every slide with '# '. The first slide (title + subtitle, no bullets)
-  is the title slide.
-- 3-6 bullets per content slide, each under ~12 words. Push detail into 'Notes:'.
+{_FORMAT_RULES}
 - Flow: title -> agenda/overview -> grouped sections -> summary/next steps.
-- Embed an image with a bullet '![alt](url)' when the content includes one.
-- Put tabular data in a Markdown '| col | col |' table instead of bullets.
-- Put commands or code in a ``` fence; it renders as a monospace box.
-- {_QUALITY_BAR}
+{_QUALITY_BAR}
 
 If this isn't a deck/presentation request, ignore this and answer normally.
 When the user later asks for changes, reply with the full revised outline."""

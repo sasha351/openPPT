@@ -51,7 +51,7 @@ def test_inlet_injects_primer_when_template_present(monkeypatch):
     assert roles == ["system", "system", "user"]
     primer = out["messages"][1]["content"]
     assert SENTINEL in primer
-    assert "@layout:" in primer
+    assert 'layout="' in primer
     assert "Section Header" in primer  # a real template layout name
     assert "concrete" in primer  # content-quality bar
 
@@ -90,7 +90,7 @@ def test_inlet_primes_without_template_on_deck_request(monkeypatch):
     assert roles == ["system", "user"]
     primer = out["messages"][0]["content"]
     assert SENTINEL in primer
-    assert "@layout:" not in primer
+    assert 'layout="' not in primer
     assert "concrete" in primer
 
 

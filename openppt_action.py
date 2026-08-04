@@ -1,16 +1,18 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.6.1
+version: 0.7.0
 requirements: python-pptx
-description: Adds an "Export to PowerPoint" button that converts a Markdown outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
+description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
 
+import html
 import inspect
 import io
 import re
 import urllib.request
 import uuid
+from html.parser import HTMLParser
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -20,38 +22,16 @@ from pptx.util import Emu, Pt
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
-IMAGE_RE = re.compile(r"^!\[(.*?)\]\((.*?)\)$")
-NOTES_RE = re.compile(r"^notes?:\s*(.*)$", re.IGNORECASE)
-# '# Title @layout: Section Header' or '# Title {layout: Section Header}'
-LAYOUT_RE = re.compile(r"\s*(?:@layout:|\{layout:)\s*([^}]+?)\}?\s*$", re.IGNORECASE)
-LAYOUT_LINE_RE = re.compile(r"^layout:\s*(.*)$", re.IGNORECASE)
-
-# Tolerant slide-start grammar: real models rarely stick to plain '# '.
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)")
-SLIDE_PREFIX_RE = re.compile(r"^\**slide\s*\d+\s*[:.\-]\s*(.+?)\**$", re.IGNORECASE)
-BOLD_ONLY_RE = re.compile(r"^\*\*(.+?)\*\*:?$")
-SEPARATOR_RE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
-QUOTE_RE = re.compile(r"^>\s*(.*)")
-BULLET_RE = re.compile(r"^([-*+]|\d+[.)])\s+(.+)")
-# '|---|:--:|' alignment row of a Markdown table — dropped, it isn't data.
-TABLE_SEP_RE = re.compile(r"^:?-+:?$")
-LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-
 # Precedes anything openPPT appends to a chat message — the download link, the
 # no-outline diagnostic. An HTML comment renders invisibly in chat but survives
-# a round trip back in, and parse_outline stops at this line, so re-clicking
-# Export can't parse openPPT's own output back into slides (v0.3.5 exported its
-# own error report as a deck).
+# a round trip back in, and the parser stops dead at this comment (see
+# _OutlineParser.handle_comment), so re-clicking Export can't parse openPPT's
+# own output back into slides (v0.3.5 exported its own error report as a deck).
 APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.6.1"
-
-
-def _strip_md(text: str) -> str:
-    """Flatten inline Markdown so bullets read as plain text on a slide."""
-    return re.sub(r"[*`]+", "", LINK_RE.sub(r"\1", text)).strip()
+VERSION = "0.7.0"
 
 
 def _new_slide(title: str, layout: str = "") -> dict:
@@ -66,40 +46,259 @@ def _new_slide(title: str, layout: str = "") -> dict:
     }
 
 
-def _split_layout(title: str):
-    """Pull a trailing '@layout: X' / '{layout: X}' off a heading title."""
-    m = LAYOUT_RE.search(title)
-    if m:
-        return title[: m.start()].strip(), m.group(1).strip()
-    return title, ""
+def _attr(attrs: dict, name: str) -> str:
+    return (attrs.get(name) or "").strip()
 
 
-def _slide_level(lines) -> int:
-    """Heading level that marks slides: whichever is most frequent.
+class _OutlineParser(HTMLParser):
+    """Turns a stream of tag events into the same slide-dict shape the old
+    Markdown parser produced, so build_pptx and everything downstream needs
+    no changes.
 
-    A deck written with '## ' slides and one '# ' deck title should not treat
-    every '## ' as a bullet, which is what keying on '# ' alone does.
+    Deliberately tolerant rather than a strict-HTML validator, because local
+    models don't emit strict HTML any more reliably than they emitted strict
+    Markdown: unclosed '<slide>'/'<li>'/'<p>' tags are auto-closed, stray text
+    directly inside '<slide>' (not wrapped in '<p>'/'<li>') still becomes a
+    bullet instead of being dropped, and '<blockquote>' is accepted as a
+    synonym for '<notes>'. HTMLParser itself is already lenient about
+    malformed markup (mismatched tags, missing quotes, bad nesting) and never
+    raises on it, which is most of why HTML beats hand-rolled regex here.
     """
-    counts, unfenced = {}, {}
-    fenced = False
-    for raw in lines:
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.slides = []
+        self.current = None
+        self.in_slide = False
+        self.stopped = False
+        self._reset_slide_state()
+
+    def _reset_slide_state(self):
+        self.list_depth = 0
+        self.li_stack = []  # [{"level", "buf": [str], "image": dict|None, "emitted": bool}]
+        self.pre_depth = 0
+        self.code_buf = []
+        self.notes_depth = 0
+        self.notes_buf = []
+        self.p_depth = 0
+        self.p_buf = []
+        self.table = None
+        self.row = None
+        self.cell_depth = 0
+        self.cell_buf = []
+
+    def _close_slide(self):
+        """Flush whatever was still open (unclosed li/p/notes/table/pre) and
+        end the current slide — called on '</slide>', on a new '<slide>'
+        opening without a previous close, and at end-of-document."""
+        while self.li_stack:
+            frame = self.li_stack.pop()
+            if not frame["emitted"] and frame["image"] is not None:
+                self.current["bullets"].append((frame["level"], frame["image"]))
+            text = "".join(frame["buf"]).strip()
+            if text:
+                self.current["bullets"].append((frame["level"], text))
+        if self.p_depth > 0:
+            text = "".join(self.p_buf).strip()
+            if text:
+                self.current["bullets"].append((0, text))
+        if self.notes_depth > 0:
+            text = "".join(self.notes_buf).strip()
+            if text:
+                self.current["notes"] = (self.current["notes"] + "\n" + text).strip()
+        if self.table is not None:
+            if self.row is not None:
+                self.table.append(self.row)
+            self.current["table"].extend(self.table)
+        if self.pre_depth > 0:
+            self.current["code"] += "".join(self.code_buf)
+        self._reset_slide_state()
+        self.in_slide = False
+        self.current = None
+
+    def handle_comment(self, data):
+        if data.strip() == "openppt":
+            self.stopped = True  # hard stop: never parse openPPT's own appendix
+
+    def handle_starttag(self, tag, attrs):
+        if self.stopped:
+            return
+        a = dict(attrs)
+        if self.pre_depth > 0 and tag != "pre":
+            if tag != "code":  # transparent — doesn't count as nesting depth
+                self.code_buf.append(self.get_starttag_text())
+            return
+        if tag == "pre":
+            self.pre_depth += 1
+            return
+        if tag == "slide":
+            if self.in_slide:
+                self._close_slide()  # tolerate a missing '</slide>'
+            self.current = _new_slide(_attr(a, "title"), _attr(a, "layout"))
+            self.current["subtitle"] = _attr(a, "subtitle")
+            self.slides.append(self.current)
+            self.in_slide = True
+            return
+        if not self.in_slide:
+            return  # stray tag before the first '<slide>' — ignore
+        if tag in ("ul", "ol"):
+            if self.li_stack:
+                # A nested list inside a still-open '<li>' — flush that li's
+                # own text now, in document order, rather than waiting for its
+                # '</li>' (which comes after the nested list closes and would
+                # put the parent's text after its children's).
+                top = self.li_stack[-1]
+                if not top["emitted"]:
+                    if top["image"] is not None:
+                        self.current["bullets"].append((top["level"], top["image"]))
+                    else:
+                        text = "".join(top["buf"]).strip()
+                        if text:
+                            self.current["bullets"].append((top["level"], text))
+                    top["buf"] = []
+                    top["emitted"] = True
+            self.list_depth += 1
+        elif tag == "li":
+            level = min(self.list_depth - 1, 4) if self.list_depth > 0 else 0
+            self.li_stack.append(
+                {"level": max(level, 0), "buf": [], "image": None, "emitted": False}
+            )
+        elif tag == "img":
+            image = {"alt": _attr(a, "alt"), "image": _attr(a, "src")}
+            if self.li_stack:
+                self.li_stack[-1]["image"] = image
+            else:
+                self.current["bullets"].append((0, image))
+        elif tag in ("notes", "blockquote"):
+            self.notes_depth += 1
+        elif tag == "p":
+            self.p_depth += 1
+        elif tag == "table":
+            self.table = []
+        elif tag == "tr":
+            self.row = []
+        elif tag in ("td", "th"):
+            self.cell_depth += 1
+
+    def handle_endtag(self, tag):
+        if self.stopped:
+            return
+        if self.pre_depth > 0 and tag != "pre":
+            if tag != "code":
+                self.code_buf.append(f"</{tag}>")
+            return
+        if tag == "pre":
+            self.pre_depth = max(0, self.pre_depth - 1)
+            if self.pre_depth == 0 and self.in_slide:
+                self.current["code"] += "".join(self.code_buf)
+                self.code_buf = []
+            return
+        if tag == "slide":
+            if self.in_slide:
+                self._close_slide()
+            return
+        if not self.in_slide:
+            return
+        if tag in ("ul", "ol"):
+            self.list_depth = max(0, self.list_depth - 1)
+        elif tag == "li":
+            if self.li_stack:
+                frame = self.li_stack.pop()
+                if not frame["emitted"] and frame["image"] is not None:
+                    self.current["bullets"].append((frame["level"], frame["image"]))
+                text = "".join(frame["buf"]).strip()
+                if text:
+                    self.current["bullets"].append((frame["level"], text))
+        elif tag in ("notes", "blockquote"):
+            self.notes_depth = max(0, self.notes_depth - 1)
+            if self.notes_depth == 0:
+                text = "".join(self.notes_buf).strip()
+                self.notes_buf = []
+                if text:
+                    self.current["notes"] = (self.current["notes"] + "\n" + text).strip()
+        elif tag == "p":
+            self.p_depth = max(0, self.p_depth - 1)
+            if self.p_depth == 0:
+                text = "".join(self.p_buf).strip()
+                self.p_buf = []
+                if text:
+                    self.current["bullets"].append((0, text))
+        elif tag == "table":
+            if self.table is not None:
+                self.current["table"].extend(self.table)
+                self.table = None
+        elif tag == "tr":
+            if self.row is not None and self.table is not None:
+                self.table.append(self.row)
+            self.row = None
+        elif tag in ("td", "th"):
+            if self.cell_depth > 0:
+                self.cell_depth -= 1
+                text = "".join(self.cell_buf).strip()
+                self.cell_buf = []
+                if self.row is not None:
+                    self.row.append(text)
+
+    def handle_data(self, data):
+        if self.stopped or not self.in_slide:
+            return
+        if self.pre_depth > 0:
+            self.code_buf.append(data)
+        elif self.cell_depth > 0:
+            self.cell_buf.append(data)
+        elif self.li_stack:
+            self.li_stack[-1]["buf"].append(data)
+        elif self.p_depth > 0:
+            self.p_buf.append(data)
+        elif self.notes_depth > 0:
+            self.notes_buf.append(data)
+        else:
+            # Bare text directly inside '<slide>', not wrapped in '<p>'/'<li>'
+            # — models forget the wrapper constantly, so treat it as a bullet
+            # rather than silently dropping the content.
+            text = data.strip()
+            if text:
+                self.current["bullets"].append((0, text))
+
+
+def _extract_fences(text: str) -> str:
+    """Handle ``` fences the model adds despite being asked for plain HTML.
+
+    A fence opened before the first '<slide' is a wrapper around the whole
+    answer (models do this constantly) — unwrapped and parsed through. A
+    fence opened after is a real code sample; its content is HTML-escaped and
+    spliced in as a '<pre>' block so the outline parser needs only one code
+    path ('<pre>', wherever the text came from), and code containing '<'/'>'
+    can't be mistaken for markup.
+    """
+    seen_slide = False
+    in_fence = False
+    fence_is_code = False
+    code_lines = []
+    out = []
+    for raw in text.splitlines():
         if raw.strip().startswith("```"):
-            fenced = not fenced
+            if not in_fence:
+                in_fence, fence_is_code, code_lines = True, seen_slide, []
+            else:
+                in_fence = False
+                if fence_is_code:
+                    out.append(f"<pre>{html.escape(chr(10).join(code_lines))}</pre>")
+                else:
+                    out.extend(code_lines)
             continue
-        m = HEADING_RE.match(raw.strip())
-        if m:
-            lvl = len(m.group(1))
-            counts[lvl] = counts.get(lvl, 0) + 1
-            if not fenced:
-                unfenced[lvl] = unfenced.get(lvl, 0) + 1
-    # '# comment' inside a code block is not a slide heading — but a model that
-    # wrapped its whole outline in one fence has no unfenced heading at all,
-    # and dropping them all would lose the deck.
-    counts = unfenced or counts
-    if not counts:
-        return 0
-    top = max(counts.values())
-    return min(lvl for lvl, n in counts.items() if n == top)
+        if in_fence:
+            code_lines.append(raw)
+            continue
+        if "<slide" in raw.lower():
+            seen_slide = True
+        out.append(raw)
+    if in_fence:  # unclosed fence at EOF — flush what we have instead of losing it
+        if fence_is_code:
+            out.append(f"<pre>{html.escape(chr(10).join(code_lines))}</pre>")
+        else:
+            out.extend(code_lines)
+    return "\n".join(out)
 
 # Placeholder type groups (see PP_PLACEHOLDER).
 TITLE_TYPES = (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE)
@@ -114,137 +313,49 @@ CHROME_TYPES = (
 )
 
 
-def parse_outline(markdown: str) -> list:
-    """Parse a Markdown outline into slides.
+def parse_outline(markup: str) -> list:
+    """Parse an HTML outline into slides.
 
     Each slide is {"title", "subtitle", "layout", "notes", "table", "code",
     "bullets": [(level, text) | (level, {"image": url, "alt": alt})]}.
 
-    '# Heading' starts a slide, '-'/'*'/'1.' lines are bullets (indent = nesting),
-    '## ' on a bullet-less first slide is its subtitle. A bullet written as
-    '![alt](url)' embeds an image instead of text. A line starting with
-    'Notes:' (anywhere after the slide heading) is appended to that slide's
-    speaker notes.
+    Each '<slide title="..." subtitle="..." layout="...">' element is one
+    slide; 'subtitle' and 'layout' are optional, and 'layout' names a
+    template layout matched against the template's layouts in build_pptx.
+    Inside a slide: '<ul>'/'<ol>' of '<li>' are bullets, with a nested
+    '<ul>'/'<ol>' inside an '<li>' nesting the bullet under it; '<p>' is a
+    single bullet; '<notes>' (or '<blockquote>') is appended to the slide's
+    speaker notes; '<img src="..." alt="...">' — bare or inside an '<li>' —
+    embeds an image instead of text; '<table>' of '<tr>' of '<td>'/'<th>'
+    becomes a real table; and '<pre>' (with or without a nested '<code>')
+    becomes a code block rendered in a monospace box. A ``` fence is also
+    accepted as a code block for models that fall back to it out of habit —
+    escaped and folded into an equivalent '<pre>' before parsing.
 
-    A slide can name a template layout so the model chooses the design per
-    slide: either inline on the heading — '# Title @layout: Section Header'
-    (or '{layout: Section Header}') — or on its own 'Layout: <name>' line.
-    The name is matched against the template's layouts in build_pptx.
+    The parser (html.parser.HTMLParser, stdlib) is deliberately tolerant
+    rather than a strict validator: an unclosed '<slide>'/'<li>'/'<p>' is
+    auto-closed by whatever ends it (the next '<slide>', or end of input),
+    and bare text sitting directly inside '<slide>' — not wrapped in '<p>' or
+    '<li>' — still becomes a bullet instead of being silently dropped. Text
+    outside any '<slide>' (chat preamble, unknown tags) is ignored. A ```
+    fence that opens before the first '<slide>' is a wrapper around the whole
+    answer, not a code sample, and is unwrapped rather than swallowing the
+    deck — models wrap their answer in one whether or not you ask them to.
 
-    The grammar is tolerant, because local models rarely emit plain '# '
-    exactly. Slides start at whichever heading level is most frequent, so a
-    '## '-per-slide deck works and a lone '# ' above it becomes the deck
-    title. With no headings at all, 'Slide 3: Title' prefixes, lone
-    '**Bold Title**' lines and '---' separators start slides instead.
-    Bullets may use '-', '*', '+', '1.' or '1)', and '> ' quoted lines are
-    speaker notes alongside 'Notes:'. Inline '**bold**', '`code`' and
-    '[links](url)' are flattened to plain text.
-
-    '|'-delimited lines become a table on that slide (the '|---|' alignment
-    row is dropped), and a ``` fence becomes a code block rendered in a
-    monospace box. A fence opened before the first slide is treated as a
-    wrapper around the whole outline and parsed through, since models wrap
-    their answer in one whether or not you ask them to.
-
-    Text before the first slide marker (chat prose) is ignored. Returns []
-    if no slides found. Everything from the `APPENDIX_MARKER` line onward is
-    ignored too, so re-exporting a message openPPT already appended to (a
-    download link, a diagnostic) doesn't parse that text back into slides.
-    Pre-0.4.0 openPPT versions appended output with no marker at all, so a
-    line starting with '**openPPT v0.3' or '📊 [Download ' also ends parsing.
+    Returns [] if no slides found. Parsing stops dead at the first
+    `APPENDIX_MARKER` HTML comment, so re-exporting a message openPPT already
+    appended to (a download link, a diagnostic) never parses that text back
+    into slides — even if the model's own last '<slide>' was left unclosed.
     """
-    lines = markdown.splitlines()
-    level_marker = _slide_level(lines)
-
-    slides = []
-    slide = None
-    expect_title = False
-    in_fence = False
-    fence_slide = None
-
-    def start(title, layout=""):
-        nonlocal slide
-        slide = _new_slide(title, layout)
-        slides.append(slide)
-
-    for raw in lines:
-        line = raw.strip()
-        if line == APPENDIX_MARKER or line.startswith(("**openPPT v0.3", "\U0001F4CA [Download ")):
-            break  # openPPT's own appended output — pre-0.4.0 versions had no marker
-        if line.startswith("```"):
-            if in_fence:
-                in_fence, fence_slide = False, None
-            else:
-                # A fence that opens before the first slide wraps the whole
-                # outline (models do this constantly despite being told not
-                # to) — keep parsing through it instead of eating the deck.
-                in_fence, fence_slide = True, slide
-            continue
-        if in_fence and fence_slide is not None:
-            fence_slide["code"] += raw + "\n"
-            continue
-        if not line:
-            continue
-
-        heading = HEADING_RE.match(line)
-        if heading and level_marker:
-            lvl = len(heading.group(1))
-            title, layout = _split_layout(heading.group(2).strip())
-            if lvl <= level_marker:
-                start(_strip_md(title), layout)
-                continue
-            if lvl == level_marker + 1 and len(slides) == 1 and not slide["bullets"]:
-                slide["subtitle"] = _strip_md(title)
-                continue
-            if slide is not None:
-                slide["bullets"].append((0, _strip_md(title)))
-            continue
-
-        if not level_marker:
-            if SEPARATOR_RE.match(line):
-                expect_title = True
-                continue
-            prefixed = SLIDE_PREFIX_RE.match(line)
-            bolded = BOLD_ONLY_RE.match(line)
-            if prefixed or bolded:
-                title, layout = _split_layout((prefixed or bolded).group(1).strip())
-                start(_strip_md(title), layout)
-                expect_title = False
-                continue
-            if expect_title and not BULLET_RE.match(line):
-                title, layout = _split_layout(line)
-                start(_strip_md(title), layout)
-                expect_title = False
-                continue
-
-        if slide is None:
-            continue
-
-        notes_match = NOTES_RE.match(line) or QUOTE_RE.match(line)
-        if notes_match:
-            slide["notes"] = (slide["notes"] + "\n" + notes_match.group(1)).strip()
-            continue
-        layout_line = LAYOUT_LINE_RE.match(line)
-        if layout_line:
-            slide["layout"] = layout_line.group(1).strip()
-            continue
-
-        if line.startswith("|") and line.endswith("|") and line.count("|") > 1:
-            cells = [_strip_md(c) for c in line[1:-1].split("|")]
-            if not all(TABLE_SEP_RE.match(c) for c in cells if c):
-                slide["table"].append(cells)
-            continue
-
-        indent = len(raw) - len(raw.lstrip())
-        level = min(indent // 2, 4)
-        bullet = BULLET_RE.match(line)
-        text = bullet.group(2).strip() if bullet else line
-        image_match = IMAGE_RE.match(text)
-        if image_match:
-            slide["bullets"].append((level, {"alt": image_match.group(1), "image": image_match.group(2)}))
-        else:
-            slide["bullets"].append((level, _strip_md(text)))
-    return slides
+    parser = _OutlineParser()
+    try:
+        parser.feed(_extract_fences(markup))
+        parser.close()
+    except Exception:
+        pass  # never raise — whatever slides were parsed before the failure still count
+    if parser.in_slide:
+        parser._close_slide()
+    return parser.slides
 
 
 async def _maybe_await(value):
