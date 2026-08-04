@@ -675,3 +675,30 @@ def test_history_wins_when_the_flat_message_list_lags_behind():
     assert openppt_action._chat_messages({}) == []
     assert openppt_action._saved_shape(chat) == "flat=1 hist=2"
     assert openppt_action._saved_shape(None) == "none"
+
+
+def test_missing_assistant_reply_is_not_reported_as_a_bad_outline():
+    # flat=1 hist=1 in the wild: the chat holds only the user's turn, so there
+    # is no reply to have an outline in. Blaming the outline format here sends
+    # people off rewriting a message that was never the problem.
+    import asyncio
+
+    events = []
+
+    async def emitter(event):
+        events.append(event)
+
+    body = {"chat_id": "c1", "id": "m2", "messages": [{"role": "user", "content": "deck pls"}]}
+    action = openppt_action.Action()
+    action._saved_chat = lambda b: _async({"messages": [{"role": "user", "content": "deck pls"}]})
+    asyncio.get_event_loop().run_until_complete(action.action(body, {}, emitter))
+    text = " ".join(
+        str(e.get("data", {}).get("content", "")) for e in events
+    )
+    assert "never received the model's reply" in text, text
+    assert "no assistant reply reached openPPT" in text, text
+    assert "nothing slide-shaped" not in text, text
+
+
+async def _async(value):
+    return value

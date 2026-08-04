@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.7.2
+version: 0.7.3
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -31,7 +31,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 
 
 def _new_slide(title: str, layout: str = "") -> dict:
@@ -860,11 +860,36 @@ class Action:
                 # no chat_id to look up with. A missing chat_id is the strongest
                 # unsaved-chat signal there is, so it must not suppress the hint.
                 temp_chat = saved_chat is None
-                help_text = (
-                    "openPPT: nothing slide-shaped in that message. Ask the model for "
-                    "an outline — a '# Slide Title' heading per slide, with '-' "
-                    "bullets under it."
+                # "Fix your outline" is the wrong advice when there is no reply
+                # to have an outline in — and that's a distinct failure: neither
+                # the request nor the saved chat holds an assistant message, so
+                # the model's text never reached openPPT at all. Blaming the
+                # outline sends people off rewriting a reply that was fine.
+                no_reply = not any(
+                    isinstance(m, dict) and m.get("role") == "assistant"
+                    for m in list(messages or []) + _chat_messages(saved_chat)
                 )
+                if no_reply:
+                    help_text = (
+                        "openPPT never received the model's reply. Neither this "
+                        "export request nor Open WebUI's saved copy of the chat "
+                        "contains an assistant message, so there was no text to "
+                        "read — this isn't about the outline's format. Reload the "
+                        "page: if the reply disappears, Open WebUI isn't saving "
+                        "it, so check that this isn't a Temporary Chat and that "
+                        "chat history saving is on."
+                    )
+                else:
+                    # Deliberately describes the grammar without writing a real
+                    # tag: this text is posted back into the chat, and a literal
+                    # slide element here would make the diagnostic itself parse
+                    # as a deck on the next click (see the v0.3.5 guard in
+                    # test_no_outline_diagnostic_is_not_itself_slide_shaped).
+                    help_text = (
+                        "openPPT: nothing slide-shaped in that message. Ask the model "
+                        "for an HTML outline — one 'slide' element per slide, each "
+                        "carrying a title attribute, with 'ul'/'li' bullets inside it."
+                    )
                 if temp_chat:
                     help_text += (
                         " This looks like a Temporary Chat — Open WebUI doesn't "
@@ -882,8 +907,12 @@ class Action:
                     "; looks like a Temporary Chat — turn it off and retry"
                     if temp_chat else ""
                 )
+                lead = (
+                    "no assistant reply reached openPPT (not the outline's fault)"
+                    if no_reply else "nothing slide-shaped here"
+                )
                 toast = (
-                    f"openPPT {VERSION}: nothing slide-shaped here — read "
+                    f"openPPT {VERSION}: {lead} — read "
                     f"{len(content)} chars from {len(messages)} messages "
                     f"[{_shape(messages)}]; chat_id "
                     f"{'present' if body.get('chat_id') else 'MISSING'}; "
