@@ -1,5 +1,7 @@
 import io
 
+import openppt_action
+
 from pptx import Presentation
 
 from openppt_action import (
@@ -648,3 +650,28 @@ if __name__ == "__main__":
         if _name.startswith("test_"):
             _fn()
     print("ok")
+
+
+def test_history_wins_when_the_flat_message_list_lags_behind():
+    # Open WebUI's saved chat keeps the conversation twice; the flat list is
+    # rebuilt on save and can hold only the user turn while history already has
+    # the assistant's reply. Reading the emptier store loses the outline.
+    chat = {
+        "messages": [{"role": "user", "content": "make a deck"}],
+        "history": {
+            "messages": {
+                "a": {"role": "user", "content": "make a deck"},
+                "b": {"role": "assistant", "content": "<slide title='X'></slide>"},
+            }
+        },
+    }
+    picked = openppt_action._chat_messages(chat)
+    assert len(picked) == 2, picked
+    assert openppt_action.parse_outline(openppt_action._pick_outline(picked))
+
+    # ...but a complete flat list still wins over an empty history.
+    flat_only = {"messages": [{"role": "assistant", "content": "hi"}], "history": {}}
+    assert len(openppt_action._chat_messages(flat_only)) == 1
+    assert openppt_action._chat_messages({}) == []
+    assert openppt_action._saved_shape(chat) == "flat=1 hist=2"
+    assert openppt_action._saved_shape(None) == "none"

@@ -1,7 +1,7 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.7.1
+version: 0.7.2
 requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
@@ -31,7 +31,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 
 def _new_slide(title: str, layout: str = "") -> dict:
@@ -711,18 +711,22 @@ def _chat_messages(chat) -> list:
 
     Open WebUI keeps the same conversation twice — a flat 'messages' list and
     a 'history.messages' id->message map — and which one is populated varies
-    by version, so read whichever has content.
+    by version, so read whichever holds more. Not "flat if it's non-empty":
+    the flat list can lag a turn behind the history map (it's rebuilt from the
+    current branch on save), and a flat list holding just the user's message
+    would then shadow a history that has the assistant's reply in it.
     """
     if not isinstance(chat, dict):
         return []
     flat = chat.get("messages")
-    if isinstance(flat, list) and flat:
-        return flat
+    flat = flat if isinstance(flat, list) else []
     history = chat.get("history")
     hist = history.get("messages") if isinstance(history, dict) else None
     if isinstance(hist, dict):
-        return list(hist.values())
-    return hist if isinstance(hist, list) else []
+        hist = list(hist.values())
+    elif not isinstance(hist, list):
+        hist = []
+    return hist if len(hist) > len(flat) else flat
 
 
 def _shape(messages: list) -> str:
@@ -742,6 +746,29 @@ def _shape(messages: list) -> str:
         size = len(body) if hasattr(body, "__len__") else "?"
         parts.append(f"{msg.get('role', '?')}:{type(body).__name__}({size})")
     return ", ".join(parts) or "(none)"
+
+
+def _saved_shape(chat) -> str:
+    """'flat=1 hist=3' — how many messages each of the saved chat's two message
+    stores holds, or why there's no saved copy at all.
+
+    Read only when the request carried no outline and the saved-chat fallback
+    didn't rescue it, where three very different failures look identical from
+    the outside: the chat lookup failed (Open WebUI API drift, temporary chat),
+    the chat is saved but the assistant turn isn't in it yet, or both stores
+    disagree and _chat_messages read the emptier one.
+    """
+    if chat is None:
+        return "none"
+    if not isinstance(chat, dict):
+        return f"{type(chat).__name__}!"
+
+    def size(v):
+        return len(v) if hasattr(v, "__len__") else "?"
+
+    history = chat.get("history")
+    hist = history.get("messages") if isinstance(history, dict) else None
+    return f"flat={size(chat.get('messages'))} hist={size(hist)}"
 
 
 def _pick_outline(messages: list, target=None) -> str:
@@ -860,6 +887,7 @@ class Action:
                     f"{len(content)} chars from {len(messages)} messages "
                     f"[{_shape(messages)}]; chat_id "
                     f"{'present' if body.get('chat_id') else 'MISSING'}; "
+                    f"saved {_saved_shape(saved_chat)}; "
                     f"starts: {head or '(empty)'}{temp_chat_note}"
                 )
                 await notify(toast, "warning")

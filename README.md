@@ -37,7 +37,7 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.7.1** afterwards.
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.7.2** afterwards.
 
 ## Outline format
 
@@ -194,6 +194,8 @@ If the outline doesn't parse (no `<slide title="...">` elements found), it exits
 ```
 pip install python-pptx pydantic && python test_parser.py && python test_filter.py
 ```
+
+v0.7.2 makes the saved-chat fallback read whichever of Open WebUI's two message stores holds more — the flat `messages` list can lag a turn behind the `history.messages` map, and preferring a non-empty flat list would shadow a history that has the assistant's reply. The no-outline diagnostic also reports both stores' sizes (`saved flat=1 hist=3`).
 
 v0.7.1 fixes the no-outline diagnostic: it now reports whether the request carried a `chat_id` at all, and the "looks like a Temporary Chat" hint fires whenever no saved copy of the chat was found — including when the request has no `chat_id`, which is exactly the unsaved-chat case the old condition suppressed.
 
