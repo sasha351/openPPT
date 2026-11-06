@@ -391,13 +391,17 @@ class _FakeRequest:
 
 
 def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
-                body_content=None, history=False):
+                body_content=None, history=False, event_call=None, valves=None):
     """Drive Action.action against stand-in Open WebUI Files/Storage modules.
 
     Open WebUI's Files API is sync in older versions and async in current ones,
     so both shapes have to work. The async fakes only record their effect
     *inside* the coroutine — a dropped 'await' therefore shows up as a missing
     file record rather than passing silently.
+
+    Whatever the action *returns* is how it edits the message on current Open
+    WebUI, so each returned message is recorded as a 'returned' pseudo-event
+    alongside the emitted ones — tests scanning event content see both.
     """
     import asyncio
     import sys
@@ -500,19 +504,25 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
              "content": content if body_content is None else body_content},
         ],
     }
+    action = Action()
+    for key, value in (valves or {}).items():
+        setattr(action.valves, key, value)
     sys.modules.update(fakes)
     try:
-        asyncio.run(
-            Action().action(
+        result = asyncio.run(
+            action.action(
                 body,
                 __user__={"id": "u1"},
                 __event_emitter__=emitter,
+                __event_call__=event_call,
                 __request__=__request__,
             )
         )
     finally:
         for key in fakes:
             sys.modules.pop(key, None)
+    for msg in (result or {}).get("messages", []):
+        events.append({"type": "returned", "data": dict(msg)})
     return events, inserted
 
 
@@ -544,12 +554,14 @@ def test_no_outline_diagnostic_is_not_itself_slide_shaped():
     still contain no '<slide>' tag under the new grammar."""
     events, inserted = _run_action(False, content="Sorry, I can't help with that.")
     assert inserted == {}  # nothing was built
-    (message,) = [e for e in events if e["type"] == "message"]
+    (message,) = [e for e in events if e["type"] in ("message", "returned")]
     posted = message["data"]["content"]
     assert APPENDIX_MARKER in posted
     assert parse_outline(posted.split(APPENDIX_MARKER, 1)[1]) == []
-    # and once appended to the message, it is invisible to the next click
-    appended = {"id": "m1", "role": "assistant", "content": "Sorry, I can't help with that." + posted}
+    # the model's own reply is kept, with the diagnostic under it
+    assert posted.startswith("Sorry, I can't help with that.")
+    # and once it's in the message, it is invisible to the next click
+    appended = {"id": "m1", "role": "assistant", "content": posted}
     assert _pick_outline([appended], "m1") == "Sorry, I can't help with that."
 
 
@@ -695,6 +707,112 @@ def test_missing_assistant_reply_is_not_reported_as_a_bad_outline():
 
 async def _async(value):
     return value
+
+
+def _returned(events):
+    return [e["data"]["content"] for e in events if e["type"] == "returned"]
+
+
+def test_export_edits_the_message_through_the_return_value():
+    """v0.10+ renders a reply from its structured 'output', not 'content', so
+    a 'message' event (which only appends to 'content') put the download link
+    where nobody could see it. Returning the edited message is Open WebUI's
+    own contract, and the frontend syncs it into 'output'."""
+    events, inserted = _run_action(False, __request__=_FakeRequest())
+    (file_id,) = inserted
+    (edited,) = _returned(events)
+    # the model's outline is kept intact, the link sits under it
+    assert edited.startswith(SAMPLE.rstrip())
+    assert f"/api/v1/files/{file_id}/content" in edited
+    assert edited.count(APPENDIX_MARKER) == 1
+    # and nothing is double-appended through the legacy event as well
+    assert not [e for e in events if e["type"] == "message"]
+
+
+def test_reexport_replaces_the_old_link_instead_of_stacking():
+    previous = SAMPLE + f"\n\n{APPENDIX_MARKER}\n📊 [Download old.pptx](/api/v1/files/old/content)"
+    events, inserted = _run_action(False, content=previous)
+    (edited,) = _returned(events)
+    assert edited.count(APPENDIX_MARKER) == 1
+    assert "old.pptx" not in edited
+
+
+def test_empty_clicked_text_never_overwrites_the_reply():
+    """With no clicked text in the request, returning a message would replace
+    the model's reply with just openPPT's link — so fall back to appending."""
+    events, inserted = _run_action(False, body_content="")
+    assert inserted  # the outline still came from the saved chat
+    assert _returned(events) == []
+    (appended,) = [e for e in events if e["type"] == "message"]
+    assert appended["data"]["content"].lstrip().startswith(APPENDIX_MARKER)
+
+
+def test_clicked_text_is_read_from_structured_output():
+    """v0.10+ keeps the reply in 'output' items; 'content' can be empty."""
+    from openppt_action import _message_text
+
+    msg = {
+        "role": "assistant",
+        "content": "",
+        "output": [
+            {"type": "reasoning", "content": [{"type": "text", "text": "thinking"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": SAMPLE}]},
+        ],
+    }
+    assert _message_text(msg) == SAMPLE
+    assert len(parse_outline(_pick_outline([dict(msg, id="m1")], "m1"))) == 4
+    # multimodal list content
+    listed = {"role": "assistant", "content": [{"type": "text", "text": SAMPLE}]}
+    assert _message_text(listed) == SAMPLE
+    assert _message_text({"role": "assistant", "content": None}) == ""
+    assert _message_text("junk") == ""
+
+
+def test_auto_download_runs_in_the_browser():
+    calls = []
+
+    async def event_call(event):
+        calls.append(event)
+        return "downloaded"
+
+    events, inserted = _run_action(False, event_call=event_call, __request__=_FakeRequest())
+    (file_id,) = inserted
+    (call,) = calls
+    assert call["type"] == "execute"
+    code = call["data"]["code"]
+    assert f'"/api/v1/files/{file_id}/content"' in code  # relative URL tried first
+    assert f"http://host.example/api/v1/files/{file_id}/content" in code
+    assert "localStorage.token" in code and ".download = name" in code
+    statuses = [e["data"].get("description", "") for e in events if e["type"] == "status"]
+    assert any("downloaded" in s for s in statuses), statuses
+
+
+def test_hanging_auto_download_does_not_block_the_export():
+    import asyncio
+
+    async def event_call(event):
+        await asyncio.sleep(30)  # a frontend that never answers
+
+    saved = openppt_action.AUTO_DOWNLOAD_TIMEOUT
+    openppt_action.AUTO_DOWNLOAD_TIMEOUT = 0.05
+    try:
+        events, inserted = _run_action(False, event_call=event_call)
+    finally:
+        openppt_action.AUTO_DOWNLOAD_TIMEOUT = saved
+    (file_id,) = inserted
+    assert any(file_id in c for c in _returned(events))  # the link still lands
+    assert not any("failed" in str(e["data"]) for e in events)
+
+
+def test_auto_download_valve_off_makes_no_browser_call():
+    calls = []
+
+    async def event_call(event):
+        calls.append(event)
+        return "downloaded"
+
+    events, inserted = _run_action(False, event_call=event_call, valves={"auto_download": False})
+    assert inserted and calls == []
 
 
 # Kept last: anything defined below this block would be skipped when the file

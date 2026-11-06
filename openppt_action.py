@@ -6,13 +6,27 @@ requirements: python-pptx
 description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
 """
 
+import asyncio
 import html
 import inspect
 import io
+import json
 import re
 import urllib.request
 import uuid
 from html.parser import HTMLParser
+
+try:
+    from pydantic import BaseModel, Field
+except ImportError:  # outline_to_pptx.py run without Open WebUI's pydantic
+
+    def Field(default=None, **_):
+        return default
+
+    class BaseModel:
+        def __init__(self, **values):
+            for name in getattr(type(self), "__annotations__", {}):
+                setattr(self, name, values.get(name, getattr(type(self), name)))
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -32,6 +46,10 @@ APPENDIX_MARKER = "<!-- openppt -->"
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
 VERSION = "0.7.3"
+
+# How long the browser gets to start the auto-download before the export
+# carries on without it (the chip and the link still deliver the file).
+AUTO_DOWNLOAD_TIMEOUT = 15
 
 
 def _new_slide(title: str, layout: str = "") -> dict:
@@ -729,6 +747,63 @@ def _chat_messages(chat) -> list:
     return hist if len(hist) > len(flat) else flat
 
 
+def _parts_text(parts) -> str:
+    """Join the 'text' of a list of content parts ({'type','text'} dicts)."""
+    texts = []
+    for part in parts if isinstance(parts, list) else []:
+        if isinstance(part, str):
+            texts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            texts.append(part["text"])
+    return "\n".join(t for t in texts if t.strip())
+
+
+def _message_text(msg) -> str:
+    """The text of a chat message, wherever this Open WebUI version keeps it.
+
+    Since v0.10, Open WebUI stores an assistant reply as structured 'output'
+    items and renders those instead of 'content', which can be stale or empty.
+    The frontend reads 'output' first ('getOutputText(output) || content'), so
+    this does the same: 'output' message items, then string 'content', then
+    list-shaped (multimodal) 'content' parts.
+    """
+    if not isinstance(msg, dict):
+        return ""
+    output = msg.get("output")
+    if isinstance(output, list):
+        texts = [
+            _parts_text(item.get("content"))
+            for item in output
+            if isinstance(item, dict) and item.get("type") == "message"
+        ]
+        joined = "\n".join(t for t in texts if t.strip())
+        if joined:
+            return joined
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    return _parts_text(content)
+
+
+def _strip_appendix(text: str) -> str:
+    """Drop whatever openPPT appended to a message on an earlier click.
+
+    The blank line right before the marker is ours too, so trim it along with
+    everything after — but only when the marker is actually present, or an
+    ordinary message's own trailing whitespace would get eaten.
+    """
+    before, marker, _ = (text or "").partition(APPENDIX_MARKER)
+    return before.rstrip() if marker else (text or "")
+
+
+def _clicked_text(messages: list, target) -> str:
+    """Text of the message the button was clicked on, minus our appendix."""
+    for msg in messages or []:
+        if isinstance(msg, dict) and target is not None and msg.get("id") == target:
+            return _strip_appendix(_message_text(msg))
+    return ""
+
+
 def _shape(messages: list) -> str:
     """'user:str(21), assistant:list(2)' — role and content shape per message.
 
@@ -744,7 +819,10 @@ def _shape(messages: list) -> str:
             continue
         body = msg.get("content")
         size = len(body) if hasattr(body, "__len__") else "?"
-        parts.append(f"{msg.get('role', '?')}:{type(body).__name__}({size})")
+        shape = f"{msg.get('role', '?')}:{type(body).__name__}({size})"
+        if isinstance(msg.get("output"), list):
+            shape += f"+output({len(msg['output'])})"
+        parts.append(shape)
     return ", ".join(parts) or "(none)"
 
 
@@ -782,22 +860,11 @@ def _pick_outline(messages: list, target=None) -> str:
     """
     candidates = []
     for msg in reversed(messages or []):
-        if msg.get("role") != "assistant":
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         # Drop our own appended output (download link, diagnostic) so a
         # re-click echoes back what the model wrote, not what we last posted.
-        # The blank line right before the marker is ours too (see the emits
-        # below), so trim it along with everything after — but only when the
-        # marker is actually present, or an ordinary message's own trailing
-        # whitespace would get eaten.
-        text = msg.get("content") or ""
-        if not isinstance(text, str):
-            # Open WebUI can hand back list-shaped (multimodal) content; treat
-            # it as no outline rather than raising out of .partition() below.
-            text = ""
-        before, marker, _ = text.partition(APPENDIX_MARKER)
-        if marker:
-            text = before.rstrip()
+        text = _strip_appendix(_message_text(msg))
         if target is not None and msg.get("id") == target:
             candidates.insert(0, text)
         else:
@@ -808,17 +875,82 @@ def _pick_outline(messages: list, target=None) -> str:
     return candidates[0] if candidates else ""
 
 
+def _download_js(urls: list, name: str) -> str:
+    """Browser-side code that downloads the deck through the user's session.
+
+    Run via Open WebUI's 'execute' event. Tries each URL in turn (relative
+    first, since the server's idea of its own base URL is wrong behind a
+    reverse proxy), and returns a short result string instead of throwing —
+    a thrown error never answers the event call, which would stall the export
+    until AUTO_DOWNLOAD_TIMEOUT.
+    """
+    return f"""
+const urls = {json.dumps(urls)};
+const name = {json.dumps(name)};
+for (const u of urls) {{
+  try {{
+    const r = await fetch(u, {{
+      headers: {{ Authorization: 'Bearer ' + (localStorage.token || '') }},
+      credentials: 'include'
+    }});
+    if (!r.ok) continue;
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = window.URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => window.URL.revokeObjectURL(a.href), 30000);
+    return 'downloaded';
+  }} catch (e) {{}}
+}}
+return 'failed';
+"""
+
+
 class Action:
+    class Valves(BaseModel):
+        auto_download: bool = Field(
+            default=True,
+            description="Download the .pptx in the browser as soon as it's built, in addition to the attachment chip and link under the message.",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+
     async def action(
         self,
         body: dict,
         __user__: dict = None,
         __event_emitter__=None,
+        __event_call__=None,
         __request__=None,
     ):
         async def emit(event):
             if __event_emitter__:
                 await __event_emitter__(event)
+
+        clicked = _clicked_text(body.get("messages", []), body.get("id"))
+
+        async def append_to_message(appendix):
+            """Add openPPT's text under the clicked message, visibly.
+
+            Returning {'messages': [...]} from the action is Open WebUI's own
+            contract for editing the message: the frontend merges it into the
+            chat and, since v0.12, syncs it into the structured 'output' the
+            reply is rendered from. A 'message' event only appends to the
+            legacy 'content', which v0.10+ doesn't render — the download link
+            was being written somewhere nobody could see it.
+
+            Only done when the clicked text is known: returning just the
+            appendix would replace the model's reply with it. Otherwise fall
+            back to the 'message' event, which can only ever append.
+            """
+            if clicked.strip() and body.get("id"):
+                return {"messages": [{"id": body["id"], "content": clicked + appendix}]}
+            await emit({"type": "message", "data": {"content": appendix}})
+            return None
 
         async def status(desc, done=False):
             await emit({"type": "status", "data": {"description": desc, "done": done}})
@@ -926,22 +1058,14 @@ class Action:
                 # rule, no bullet list, no lone '**bold**' line — otherwise the
                 # next click exports this diagnostic as a deck (v0.3.5 did).
                 seen = content[:400] if content else "(nothing — the message was empty)"
-                await emit(
-                    {
-                        "type": "message",
-                        "data": {
-                            "content": (
-                                f"\n\n{APPENDIX_MARKER}\n"
-                                f"**openPPT {VERSION} diagnostic** — {help_text} "
-                                f"(messages in request: {len(messages)}, clicked id: "
-                                f"`{target}`, read {len(content)} characters)\n\n"
-                                f"What openPPT read from that message:\n\n"
-                                f"```\n{seen}\n```\n"
-                            )
-                        },
-                    }
+                return await append_to_message(
+                    f"\n\n{APPENDIX_MARKER}\n"
+                    f"**openPPT {VERSION} diagnostic** — {help_text} "
+                    f"(messages in request: {len(messages)}, clicked id: "
+                    f"`{target}`, read {len(content)} characters)\n\n"
+                    f"What openPPT read from that message:\n\n"
+                    f"```\n{seen}\n```\n"
                 )
-                return
 
             template = await self._find_template(body, __user__)
             wants_layout = any(s.get("layout") for s in slides)
@@ -988,11 +1112,11 @@ class Action:
             if record is None:
                 raise RuntimeError("Open WebUI rejected the file record")
 
-            # Two delivery paths on purpose. The 'files' event is how Open WebUI
-            # returns its own generated files: it lands in the message's files
-            # column and renders as an attachment chip (with a .pptx preview and
-            # a download). The markdown link covers versions whose event handler
-            # ignores 'files'. Emitted separately so one failing can't lose both.
+            # Three delivery paths on purpose, because every Open WebUI version
+            # drops at least one: v0.10+ renders the 'files' chip but not text
+            # appended to 'content'; v0.9 and older render appended text but
+            # only image chips. The browser auto-download works on both (v0.6.5
+            # onward). Each is isolated so one failing can't lose the others.
             url = f"/api/v1/files/{file_id}/content"
             full_url = url
             if __request__ is not None:
@@ -1028,24 +1152,31 @@ class Action:
             except Exception as e:
                 print(f"[openPPT] files event rejected: {type(e).__name__}: {e}", flush=True)
 
+            downloaded = False
+            if self.valves.auto_download and __event_call__ is not None:
+                urls = [url] + ([full_url] if full_url != url else [])
+                try:
+                    answer = await asyncio.wait_for(
+                        __event_call__(
+                            {"type": "execute", "data": {"code": _download_js(urls, name)}}
+                        ),
+                        AUTO_DOWNLOAD_TIMEOUT,
+                    )
+                    downloaded = answer == "downloaded"
+                except Exception as e:  # incl. timeout: the chip and link remain
+                    print(f"[openPPT] auto-download skipped: {type(e).__name__}: {e}", flush=True)
+
+            done = f"{name} {'downloaded' if downloaded else 'ready'} — {full_url}"
+            await notify(done, "success")
+            await status(done, done=True)
             # The marker line lets a future export ignore everything below it
-            # (see parse_outline) — otherwise re-clicking Export on this same
-            # message would parse this link into a bogus trailing bullet. The
-            # full URL repeated on its own line is copy-pasteable even where
-            # neither the chip nor the markdown link renders.
-            await emit(
-                {
-                    "type": "message",
-                    "data": {
-                        "content": (
-                            f"\n\n{APPENDIX_MARKER}\n📊 [Download {name}]({full_url})"
-                            f"\n\n{full_url}"
-                        )
-                    },
-                }
+            # (see parse_outline), and lets a re-export replace this link rather
+            # than stack another under it. The full URL repeated on its own line
+            # is copy-pasteable even where neither the chip nor the link renders.
+            return await append_to_message(
+                f"\n\n{APPENDIX_MARKER}\n📊 [Download {name}]({full_url})"
+                f"\n\n{full_url}"
             )
-            await notify(f"{name} ready — {full_url}", "success")
-            await status(f"{name} ready — {full_url}", done=True)
         except Exception as e:
             msg = f"openPPT export failed: {type(e).__name__}: {e}"
             await notify(msg, "error")
