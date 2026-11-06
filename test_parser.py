@@ -1250,6 +1250,20 @@ def test_auto_download_valve_off_makes_no_browser_call():
     assert inserted and calls == []
 
 
+def test_a_cut_off_reply_is_flagged():
+    from openppt_action import _looks_cut_off
+
+    cut = '<slide title="A"><li>a</li></slide><slide title="B"><li>half a sent'
+    assert _looks_cut_off(cut)
+    assert not _looks_cut_off(SAMPLE)
+    assert not _looks_cut_off('<slide title="A"><li>a<slide title="B"><li>b')  # never closes any
+    events, inserted = _run_action(False, content=cut)
+    assert inserted  # still exported
+    warnings = [e["data"]["content"] for e in events
+                if e["type"] == "notification" and e["data"]["type"] == "warning"]
+    assert any("cut off" in w and "'B'" in w for w in warnings), warnings
+
+
 # Kept last: anything defined below this block would be skipped when the file
 # is run standalone (two tests silently were, before v0.8.0).
 if __name__ == "__main__":

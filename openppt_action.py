@@ -1735,6 +1735,15 @@ def _pick_outline(messages: list, target=None) -> str:
     return candidates[0] if candidates else ""
 
 
+def _looks_cut_off(text: str) -> bool:
+    """The outline closes its slides but the last one is left open — what a
+    reply stopped by the max-tokens limit looks like. (A model that never
+    writes '</slide>' at all is just terse, and the parser copes.)"""
+    body = _strip_reasoning(_strip_appendix(text or "")).lower()
+    closed = body.rfind("</slide>")
+    return closed != -1 and body.rfind("<slide") > closed
+
+
 def _download_js(urls: list, name: str) -> str:
     """Browser-side code that downloads the deck through the user's session.
 
@@ -2058,6 +2067,14 @@ class Action:
 
             done = f"{name} {'downloaded' if downloaded else 'ready'} — {full_url}"
             await notify(done, "success")
+            if _looks_cut_off(content):
+                await notify(
+                    f"The last slide ('{slides[-1]['title']}') was never closed — the "
+                    "reply was probably cut off, so the deck may be missing its end. "
+                    "Raise the model's max tokens (reasoning models spend part of "
+                    "that budget thinking) and regenerate.",
+                    "warning",
+                )
             await status(done, done=True)
             # The marker line lets a future export ignore everything below it
             # (see parse_outline), and lets a re-export replace this link rather
