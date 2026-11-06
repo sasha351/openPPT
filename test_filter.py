@@ -126,20 +126,17 @@ def test_inlet_never_raises_on_bad_template(monkeypatch):
 
 
 if __name__ == "__main__":
-    import types
+    import inspect
 
     class _MP:
+        """Just enough of pytest's monkeypatch fixture to run standalone."""
+
         def setattr(self, obj, name, val):
             setattr(obj, name, val)
 
-    mp = _MP()
-    test_describe_layout_hints()
-    test_layouts_from_bytes_lists_template_layouts()
-    test_inlet_injects_primer_when_template_present(mp)
-    test_inlet_noop_without_template(mp)
-    test_looks_like_deck_request()
-    test_inlet_primes_without_template_on_deck_request(mp)
-    test_inlet_respects_prime_without_template_valve_disabled(mp)
-    test_inlet_does_not_double_prime(mp)
-    test_inlet_never_raises_on_bad_template(mp)
+    # Auto-discover like test_parser.py, so a new test can't be forgotten here.
+    for _name, _fn in sorted(list(globals().items())):
+        if _name.startswith("test_") and callable(_fn):
+            params = inspect.signature(_fn).parameters
+            _fn(*([_MP()] if "monkeypatch" in params else []))
     print("ok")

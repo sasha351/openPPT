@@ -645,13 +645,6 @@ def test_action_appends_full_url_when_request_available():
     assert download_msg.rstrip().endswith(full_link)
 
 
-if __name__ == "__main__":
-    for _name, _fn in sorted(list(globals().items())):
-        if _name.startswith("test_"):
-            _fn()
-    print("ok")
-
-
 def test_history_wins_when_the_flat_message_list_lags_behind():
     # Open WebUI's saved chat keeps the conversation twice; the flat list is
     # rebuilt on save and can hold only the user turn while history already has
@@ -691,7 +684,7 @@ def test_missing_assistant_reply_is_not_reported_as_a_bad_outline():
     body = {"chat_id": "c1", "id": "m2", "messages": [{"role": "user", "content": "deck pls"}]}
     action = openppt_action.Action()
     action._saved_chat = lambda b: _async({"messages": [{"role": "user", "content": "deck pls"}]})
-    asyncio.get_event_loop().run_until_complete(action.action(body, {}, emitter))
+    asyncio.run(action.action(body, {}, emitter))
     text = " ".join(
         str(e.get("data", {}).get("content", "")) for e in events
     )
@@ -702,3 +695,12 @@ def test_missing_assistant_reply_is_not_reported_as_a_bad_outline():
 
 async def _async(value):
     return value
+
+
+# Kept last: anything defined below this block would be skipped when the file
+# is run standalone (two tests silently were, before v0.8.0).
+if __name__ == "__main__":
+    for _name, _fn in sorted(list(globals().items())):
+        if _name.startswith("test_") and callable(_fn):
+            _fn()
+    print("ok")
