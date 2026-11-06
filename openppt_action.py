@@ -423,11 +423,41 @@ CHROME_TYPES = (
 )
 
 
+# Reasoning that a model emits inline, in every wrapper Open WebUI itself
+# recognises (its DEFAULT_REASONING_TAGS), plus the <details type="..."> blocks
+# it serialises reasoning and tool calls into in a message's legacy 'content'.
+_REASONING_BLOCK_RE = re.compile(
+    r"<(think|thinking|reason|reasoning|thought)\b[^>]*>.*?</\1\s*>"
+    r"|<details\s[^>]*\btype=[\"'][^\"']*[\"'][^>]*>.*?</details\s*>"
+    r"|<\|begin_of_thought\|>.*?<\|end_of_thought\|>"
+    r"|◁think▷.*?◁/think▷",
+    re.S | re.I,
+)
+# A closing tag with no opener: chat templates (Nemotron's, DeepSeek-R1's)
+# pre-fill '<think>' in the prompt, so the reply starts mid-reasoning.
+_ORPHAN_CLOSE_RE = re.compile(r"</(think|thinking|reasoning)\s*>", re.I)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove a reasoning model's thinking before parsing. Drafts of the deck
+    written while thinking would otherwise be exported as slides — and
+    whichever comes first, draft or final, would win slide one."""
+    text = _REASONING_BLOCK_RE.sub("", text or "")
+    last = None
+    for last in _ORPHAN_CLOSE_RE.finditer(text):
+        pass
+    if last is not None:
+        text = text[last.end():]
+    return text.replace("<|begin_of_solution|>", "").replace("<|end_of_solution|>", "")
+
+
 def parse_outline(markup: str) -> list:
     """Parse an HTML outline into slides.
 
     Each slide is {"title", "subtitle", "layout", "notes", "table", "code",
-    "bullets": [(level, text) | (level, {"image": url, "alt": alt})]}.
+    "bullets": [(level, text) | (level, {"image": url, "alt": alt})],
+    "runs": [None | [(text, formats)]] aligned with bullets,
+    "columns": [{"heading", "bullets", "runs"}]}.
 
     Each '<slide title="..." subtitle="..." layout="...">' element is one
     slide; 'subtitle' and 'layout' are optional, and 'layout' names a
@@ -441,6 +471,12 @@ def parse_outline(markup: str) -> list:
     becomes a code block rendered in a monospace box. A ``` fence is also
     accepted as a code block for models that fall back to it out of habit —
     escaped and folded into an equivalent '<pre>' before parsing.
+    '<column heading="...">' (or '<col>') splits a slide into side-by-side
+    columns holding their own bullets/images, and '<b>'/'<strong>',
+    '<i>'/'<em>', '<u>', '<code>' are kept as run formatting ('runs').
+    A reasoning model's inline thinking ('<think>…</think>' and the other
+    wrappers Open WebUI recognises, or everything up to a lone '</think>')
+    is dropped first, so slides it drafted while thinking aren't exported.
 
     The parser (html.parser.HTMLParser, stdlib) is deliberately tolerant
     rather than a strict validator: an unclosed '<slide>'/'<li>'/'<p>' is
@@ -459,7 +495,7 @@ def parse_outline(markup: str) -> list:
     """
     parser = _OutlineParser()
     try:
-        parser.feed(_extract_fences(markup))
+        parser.feed(_extract_fences(_strip_reasoning(markup)))
         parser.close()
     except Exception:
         pass  # never raise — whatever slides were parsed before the failure still count

@@ -649,6 +649,26 @@ def test_line_breaks_inside_a_bullet_are_spaces():
     assert slide["bullets"] == [(0, "wrapped across lines and a br")]
 
 
+def test_reasoning_drafts_are_not_exported():
+    """A reasoning model (Nemotron, DeepSeek-R1, Qwen3...) drafts the deck
+    while thinking; when that thinking stays in the text, the draft's slides
+    came first and became the deck."""
+    final = '<slide title="Final"><li>real</li></slide>'
+    draft = '<slide title="Draft"><li>scratch</li></slide>'
+    for wrapped in (
+        f"<think>let me plan {draft}</think>\n{final}",
+        f"<thinking>{draft}</thinking>{final}",
+        f'<details type="reasoning" done="true"><summary>Thought</summary>{draft}</details>{final}',
+        # Nemotron-style: the template pre-filled '<think>', only the close arrives
+        f"Okay, the user wants a deck. {draft} Now the final answer.</think>\n\n{final}",
+        f"<|begin_of_thought|>{draft}<|end_of_thought|><|begin_of_solution|>{final}<|end_of_solution|>",
+    ):
+        slides = parse_outline(wrapped)
+        assert [s["title"] for s in slides] == ["Final"], wrapped
+    # a plain <details> a model writes (no Open WebUI type attribute) is left alone
+    assert parse_outline(f"<details><summary>x</summary></details>{final}")[0]["title"] == "Final"
+
+
 def test_parse_table():
     (slide,) = parse_outline(TABLE_OUTLINE)
     assert slide["table"] == [
