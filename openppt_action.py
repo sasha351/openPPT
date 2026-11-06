@@ -7,11 +7,16 @@ description: Adds an "Export to PowerPoint" button that converts an HTML outline
 """
 
 import asyncio
+import base64
 import html
 import inspect
 import io
+import ipaddress
 import json
+import math
 import re
+import socket
+import urllib.parse
 import urllib.request
 import uuid
 from html.parser import HTMLParser
@@ -32,6 +37,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import MSO_AUTO_SIZE
+from pptx.oxml.ns import qn
 from pptx.util import Emu, Pt
 
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -385,14 +391,85 @@ async def _maybe_await(value):
     return await value if inspect.isawaitable(value) else value
 
 
-def _fetch_image(url: str):
-    """Return image bytes for a local path or http(s) URL, or None on failure."""
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# An Open WebUI file reference, as its own generated images are linked.
+OWUI_FILE_RE = re.compile(r"/api/v1/files/([0-9A-Za-z-]+)(?:/content)?/?(?:\?.*)?$")
+
+
+def _public_host(host: str) -> bool:
+    """True only if every address the host resolves to is publicly routable.
+
+    The URL comes from model output, and a model can be steered by whatever
+    document it was given — so the server must not fetch loopback, private,
+    or link-local addresses (cloud metadata endpoints live there) on its say.
+    """
     try:
-        if url.startswith("http://") or url.startswith("https://"):
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                return io.BytesIO(resp.read())
-        with open(url, "rb") as f:
-            return io.BytesIO(f.read())
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return bool(infos)
+
+
+class _PublicRedirects(urllib.request.HTTPRedirectHandler):
+    """Re-check the host on every redirect, or a public URL could bounce the
+    fetch into the private network."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urllib.parse.urlparse(newurl)
+        if parsed.scheme not in ("http", "https") or not _public_host(parsed.hostname or ""):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_remote_image(url: str):
+    parsed = urllib.parse.urlparse(url)
+    if not _public_host(parsed.hostname or ""):
+        return None
+    opener = urllib.request.build_opener(_PublicRedirects)
+    request = urllib.request.Request(url, headers={"User-Agent": "openPPT"})
+    with opener.open(request, timeout=10) as resp:
+        if not (resp.headers.get_content_type() or "").startswith("image/"):
+            return None
+        data = resp.read(MAX_IMAGE_BYTES + 1)
+    return data if len(data) <= MAX_IMAGE_BYTES else None
+
+
+def _load_image(src: str, images=None, allow_local=False):
+    """Image bytes plus pixel size for an <img src>, or None — never raises.
+
+    Accepted sources: anything the caller pre-resolved into `images` (the
+    Action resolves Open WebUI file links that way, since that lookup is async
+    and user-scoped), a data:image/...;base64 URI, a public http(s) URL, and —
+    only with allow_local, i.e. the command-line converter — a local path.
+    Whatever comes back must decode as an image: one bad link (an HTML page,
+    a text file) used to abort the whole export.
+    """
+    try:
+        src = (src or "").strip()
+        data = (images or {}).get(src)
+        if data is None:
+            if src.startswith("data:image/") and ";base64," in src:
+                data = base64.b64decode(src.split(",", 1)[1], validate=False)
+            elif src.startswith(("http://", "https://")):
+                data = _fetch_remote_image(src)
+            elif allow_local and src and not src.startswith("data:"):
+                with open(src, "rb") as f:
+                    data = f.read(MAX_IMAGE_BYTES + 1)
+        if not data or len(data) > MAX_IMAGE_BYTES:
+            return None
+        from PIL import Image  # python-pptx's own dependency
+
+        with Image.open(io.BytesIO(data)) as im:
+            size = im.size
+        return data, size
     except Exception:
         return None
 
@@ -498,6 +575,14 @@ def _pick_layout(prs, role: str):
         for lay, s in scored:
             if s["title"] and s["subtitle"]:
                 return lay
+    if role == "section":
+        # A divider: the template's own section layout when it has one (its
+        # name is the only reliable signal — it looks like a title slide by
+        # placeholders), else a title with nothing else to fill.
+        for lay, s in scored:
+            if "section" in lay.name.lower() and s["title"]:
+                return lay
+        role = "title_only"
     if role == "title_only":
         # A title, nothing else to fill.
         for lay, s in scored:
@@ -533,44 +618,110 @@ def _subtitle_placeholder(slide):
 
 
 def _body_placeholder(slide):
-    """First fillable body placeholder that isn't the title/subtitle/chrome."""
-    title = _title_placeholder(slide)
-    title_id = id(title) if title is not None else None
+    """First fillable body placeholder that isn't the title/subtitle/chrome.
+
+    Matched by placeholder type, never by Python identity: python-pptx hands
+    out a fresh proxy object on every access, so an id() comparison never
+    matches — and the title used to come back as the "body" on layouts with
+    no body of their own (Title Only), which then got dropped as empty.
+    """
     for ph in slide.placeholders:
-        if id(ph) == title_id:
-            continue
-        t = _ph_type(ph)
-        if t in BODY_TYPES:
+        if _ph_type(ph) in BODY_TYPES:
             return ph
     # Fall back to any non-title, non-chrome, non-subtitle placeholder.
     for ph in slide.placeholders:
-        if id(ph) == title_id:
-            continue
         t = _ph_type(ph)
-        if t in CHROME_TYPES or t in SUBTITLE_TYPES:
+        if t in TITLE_TYPES or t in CHROME_TYPES or t in SUBTITLE_TYPES:
             continue
         return ph
     return None
 
 
-def _title_size(text: str):
-    """Point size for a title long enough to overflow, or None to keep the
-    template's. python-pptx never recomputes PowerPoint's autofit, so without
-    this a 200-character title renders at full size across the whole slide."""
-    for limit, size in ((50, None), (80, 32), (120, 26), (200, 20)):
-        if len(text) <= limit:
-            return size
-    return 16
+EMU_PER_PT = 12700
+# Default text-frame insets (0.1in each side, 0.05in top and bottom), in
+# points summed over both sides — python-pptx's and PowerPoint's default.
+INSET_X, INSET_Y = 14.4, 7.2
+
+TITLE_SIZES = (40, 36, 32, 28, 24, 20, 18, 16, 14)
+BODY_SIZES = (28, 24, 22, 20, 18, 16, 14, 12, 11, 10)
+TABLE_SIZES = (18, 16, 14, 12, 11, 10, 9)
+CODE_SIZES = (16, 14, 12, 11, 10, 9, 8)
 
 
-def _body_size(bullets) -> int:
-    """Point size for a bullet list, shrinking as it gets denser. Long bullets
-    wrap, so count the lines they'll take rather than the bullets."""
-    lines = sum(1 + len(text) // 60 for _, text in bullets)
-    for limit, size in ((5, 20), (8, 16), (12, 14)):
-        if lines <= limit:
+def _pt(emu) -> float:
+    return (emu or 0) / EMU_PER_PT
+
+
+def _emu(points: float) -> Emu:
+    return Emu(int(points * EMU_PER_PT))
+
+
+def _wrapped_lines(text: str, width_pt: float, size: float, char_em: float = 0.5) -> int:
+    """How many lines `text` wraps to in a box `width_pt` wide at `size` pt.
+
+    python-pptx can't measure text, and PowerPoint only recomputes autofit
+    when a slide is edited, so the size has to be right on first open. This
+    estimates from an average character width — 0.5em errs wide for
+    proportional fonts, 0.6em for monospace — so text ends up a little smaller
+    than it could be rather than spilling out of its box.
+    """
+    per_line = max(4, int(max(width_pt, 1) / (size * char_em)))
+    return sum(max(1, math.ceil(len(part) / per_line)) for part in text.split("\n"))
+
+
+def _level_size(size: float, level: int) -> float:
+    return max(size - 2 * min(level, 2), 9)
+
+
+def _bullets_height(bullets, width_pt: float, size: float) -> float:
+    total = 0.0
+    for level, text in bullets:
+        s = _level_size(size, level)
+        indent = 18 + 22 * level  # hanging bullet indent + per-level margin
+        lines = _wrapped_lines(text, width_pt - indent, s)
+        total += lines * s * 1.2 + s * 0.2  # line height + space before
+    return total
+
+
+def _body_size(bullets, rect, max_size: float = 28) -> float:
+    """Largest size from BODY_SIZES at which `bullets` fit `rect` (EMU box) —
+    a sparse slide keeps big readable text instead of a fixed small size, a
+    dense one shrinks until it fits."""
+    # 10% slack: renderers that do recompute autofit (LibreOffice, Google
+    # Slides) shrink hard on the slightest overflow, and font metrics vary.
+    width, height = _pt(rect[2]) - INSET_X, (_pt(rect[3]) - INSET_Y) * 0.9
+    for size in BODY_SIZES:
+        if size <= max_size and _bullets_height(bullets, width, size) <= height:
             return size
-    return 12
+    return BODY_SIZES[-1]
+
+
+def _template_title_size(prs) -> float:
+    """The master's title point size (PowerPoint's default is 44)."""
+    try:
+        sz = prs.slide_master.element.xpath(
+            "./p:txStyles/p:titleStyle/a:lvl1pPr/a:defRPr/@sz"
+        )
+        return int(sz[0]) / 100 if sz else 44.0
+    except Exception:
+        return 44.0
+
+
+def _title_size(text: str, rect, template_size: float = 44.0):
+    """None when the title fits its placeholder at the template's own size
+    (so the template's styling is left alone), else the largest size that
+    fits. Without this, a long title renders at ~44pt across the bullets."""
+    width, height = _pt(rect[2]) - INSET_X, _pt(rect[3]) - INSET_Y
+
+    def fits(size):
+        return _wrapped_lines(text, width, size, 0.52) * size * 1.15 <= height
+
+    if not rect[2] or fits(template_size):
+        return None
+    for size in TITLE_SIZES:
+        if size < template_size and fits(size):
+            return size
+    return TITLE_SIZES[-1]
 
 
 def _fit(text_frame) -> None:
@@ -582,37 +733,105 @@ def _fit(text_frame) -> None:
     text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
 
 
-def _set_title(slide, text: str) -> None:
+def _size_paragraph(p, size) -> None:
+    """Set a paragraph's size on its runs as well as its defaults: PowerPoint
+    renders a run's own properties, and doesn't apply a paragraph-level
+    default to runs that already exist."""
+    p.font.size = Pt(size)
+    for run in p.runs:
+        run.font.size = Pt(size)
+
+
+def _rect(shape):
+    return (shape.left, shape.top, shape.width, shape.height)
+
+
+def _set_rect(shape, rect) -> None:
+    """Give a shape an explicit box. All four sides at once: a placeholder
+    inherits its geometry from the layout until it gets an xfrm of its own,
+    and setting just one side writes zeros for the rest — which is how bullets
+    used to vanish (width 0) on slides that also had a table or code."""
+    left, top, width, height = (Emu(int(v)) for v in rect)
+    shape.left, shape.top, shape.width, shape.height = left, top, width, height
+
+
+def _set_title(slide, text: str, template_size: float = 44.0) -> None:
     ph = _title_placeholder(slide)
     if ph is None or not ph.has_text_frame:
         return
+    rect = _rect(ph)
     ph.text_frame.text = text
     _fit(ph.text_frame)
-    size = _title_size(text)
+    size = _title_size(text, rect, template_size) if rect[2] else None
     if size:
         for p in ph.text_frame.paragraphs:
-            p.font.size = Pt(size)
+            _size_paragraph(p, size)
 
 
-def _fill_bullets(text_frame, bullets) -> None:
+def _insert_bullet_props(paragraph, element) -> None:
+    """Insert a bullet element into a:pPr in schema order (before tabLst /
+    defRPr / extLst) — out-of-order children make PowerPoint offer a repair."""
+    pPr = paragraph._p.get_or_add_pPr()
+    for tag in ("a:buNone", "a:buChar", "a:buAutoNum", "a:buFont"):
+        for old in pPr.findall(qn(tag)):
+            pPr.remove(old)
+    for i, child in enumerate(pPr):
+        if child.tag in (qn("a:tabLst"), qn("a:defRPr"), qn("a:extLst")):
+            pPr.insert(i, element)
+            return
+    pPr.append(element)
+
+
+def _no_bullet(paragraph) -> None:
+    pPr = paragraph._p.get_or_add_pPr()
+    pPr.set("marL", "0")
+    pPr.set("indent", "0")
+    _insert_bullet_props(paragraph, pPr.makeelement(qn("a:buNone"), {}))
+
+
+def _bullet_glyph(paragraph, level: int) -> None:
+    """A real bullet on a plain text box paragraph (placeholders get theirs
+    from the layout; a text box has none)."""
+    pPr = paragraph._p.get_or_add_pPr()
+    pPr.set("marL", str(int(Pt(18 + 22 * level))))
+    pPr.set("indent", str(-int(Pt(18))))
+    _insert_bullet_props(paragraph, pPr.makeelement(qn("a:buChar"), {"char": "•"}))
+
+
+def _fill_bullets(text_frame, bullets, rect, glyphs: bool = False) -> float:
     _fit(text_frame)
-    size = Pt(_body_size(bullets))
+    size = _body_size(bullets, rect)
     for j, (level, text) in enumerate(bullets):
         p = text_frame.paragraphs[0] if j == 0 else text_frame.add_paragraph()
         p.text = text
         p.level = level
-        p.font.size = size
+        _size_paragraph(p, _level_size(size, level))
+        if glyphs:
+            _bullet_glyph(p, level)
+    return size
 
 
-def _content_rect(prs, slide):
-    """Box for extra content (table, code): the body placeholder's, or a
-    margin-inset box under the title when the layout has none."""
+def _free_rect(prs, slide):
+    """Content box for a layout with no body placeholder: under the title,
+    aligned with it, down to a bottom margin."""
+    sw, sh = prs.slide_width, prs.slide_height
+    title = _title_placeholder(slide)
+    margin = int(sw * 0.05)
+    if title is not None and title.width and title.top is not None:
+        left, width = title.left, title.width
+        top = title.top + title.height + int(Pt(10))
+    else:
+        left, width, top = margin, sw - 2 * margin, int(sh * 0.08)
+    bottom = int(sh * 0.93)
+    return (left, top, width, max(bottom - top, int(sh * 0.3)))
+
+
+def _content_area(prs, slide):
+    """(body placeholder or None, its box) — the box comes from the layout."""
     body = _body_placeholder(slide)
-    if body is not None:
-        return body, (body.left, body.top, body.width, body.height)
-    left = Emu(int(prs.slide_width * 0.08))
-    top = Emu(int(prs.slide_height * 0.28))
-    return None, (left, top, prs.slide_width - 2 * left, prs.slide_height - top - left)
+    if body is not None and body.width:
+        return body, _rect(body)
+    return body, _free_rect(prs, slide)
 
 
 def _drop_shape(shape) -> None:
@@ -620,104 +839,258 @@ def _drop_shape(shape) -> None:
     shape._element.getparent().remove(shape._element)
 
 
+def _drop_empty_placeholders(slide) -> None:
+    """Remove placeholders nothing was put in. PowerPoint shows each one as a
+    'Click to add text' box — e.g. the second column of a 'Two Content'
+    layout, or a subtitle box the outline gave no subtitle for."""
+    for ph in list(slide.placeholders):
+        if _ph_type(ph) in CHROME_TYPES:
+            continue
+        if ph.has_text_frame and not ph.text_frame.text.strip():
+            _drop_shape(ph)
+
+
+def _add_lead(slide, text: str, area):
+    """A content slide's subtitle, as a lead line above its content when the
+    layout has no subtitle placeholder (it used to be written into the body
+    and then overwritten by the first bullet). Returns the remaining area."""
+    left, top, width, height = area
+    size = 18
+    lines = min(_wrapped_lines(text, _pt(width) - INSET_X, size), 3)
+    box_h = int(_emu(lines * size * 1.25 + INSET_Y))
+    box = slide.shapes.add_textbox(left, top, width, box_h)
+    box.text_frame.word_wrap = True
+    p = box.text_frame.paragraphs[0]
+    p.text = text
+    _size_paragraph(p, size)
+    for run in p.runs:
+        run.font.italic = True
+    gap = int(Pt(6))
+    return (left, top + box_h + gap, width, max(height - box_h - gap, int(height * 0.3)))
+
+
+def _table_layout(rows, width_pt: float, size: float):
+    """Column widths (by content length, so a long column isn't squeezed to
+    the width of a one-word one) and row heights (by wrapped lines), in pt."""
+    cols = max(len(r) for r in rows)
+    lens = [max(len(r[c]) if c < len(r) else 0 for r in rows) for c in range(cols)]
+    weights = [max(n, 4) ** 0.8 for n in lens]
+    widths = [width_pt * w / sum(weights) for w in weights]
+    heights = []
+    for r in rows:
+        lines = max(
+            _wrapped_lines(r[c] if c < len(r) else "", widths[c] - INSET_X, size)
+            for c in range(cols)
+        )
+        heights.append(lines * size * 1.2 + INSET_Y + 2)
+    return widths, heights
+
+
+def _table_height(rows, width_pt: float, size: float) -> float:
+    return sum(_table_layout(rows, width_pt, size)[1])
+
+
 def _add_table(slide, rows, rect) -> None:
     left, top, width, height = rect
-    cols = max(len(r) for r in rows)
-    table = slide.shapes.add_table(len(rows), cols, left, top, width, height).table
-    size = Pt(14 if len(rows) <= 6 else 11)
+    width_pt, height_pt = _pt(width), _pt(height)
+    for size in TABLE_SIZES:
+        widths, heights = _table_layout(rows, width_pt, size)
+        if sum(heights) <= height_pt:
+            break
+    cols = len(widths)
+    shape = slide.shapes.add_table(len(rows), cols, left, top, width, _emu(sum(heights)))
+    table = shape.table
+    col_emu = [int(_emu(w)) for w in widths]
+    col_emu[-1] += int(width) - sum(col_emu)  # rounding goes to the last column
+    for c, w in enumerate(col_emu):
+        table.columns[c].width = Emu(w)
+    for r, h in enumerate(heights):
+        table.rows[r].height = _emu(h)
     for r, row in enumerate(rows):
         for c in range(cols):
             cell = table.cell(r, c)
             cell.text = row[c] if c < len(row) else ""
+            cell.text_frame.word_wrap = True
             for p in cell.text_frame.paragraphs:
-                p.font.size = size
+                _size_paragraph(p, size)
+
+
+def _code_size(code: str, rect):
+    lines = code.rstrip().splitlines() or [""]
+    width, height = _pt(rect[2]) - INSET_X, _pt(rect[3]) - INSET_Y
+    for size in CODE_SIZES:
+        wrapped = sum(_wrapped_lines(line, width, size, 0.6) for line in lines)
+        if wrapped * size * 1.2 <= height:
+            break
+    return size, wrapped * size * 1.2 + INSET_Y + 4
 
 
 def _add_code(slide, code, rect) -> None:
-    lines = code.rstrip().splitlines()
-    box = slide.shapes.add_textbox(*rect)
+    left, top, width, height = rect
+    size, needed = _code_size(code, rect)
+    box = slide.shapes.add_textbox(left, top, width, min(int(height), int(_emu(needed))))
     box.fill.solid()
     box.fill.fore_color.rgb = RGBColor(0xF4, 0xF4, 0xF4)
     tf = box.text_frame
     tf.word_wrap = True
-    # Monospace and small: code lines don't wrap gracefully, so err narrow.
-    size = Pt(14 if len(lines) <= 10 else (11 if len(lines) <= 18 else 9))
-    for j, text in enumerate(lines):
+    for j, text in enumerate(code.rstrip().splitlines() or [""]):
         p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
         p.text = text
         p.font.name = "Consolas"
-        p.font.size = size
+        _size_paragraph(p, size)
+        for run in p.runs:
+            run.font.name = "Consolas"
 
 
-def _split_rect(rect, fraction):
-    """Top `fraction` of a box, and the remainder below it, with a gutter."""
+def _add_pictures(slide, pictures, area) -> None:
+    """Fit images into `area` in a grid (up to 3 across), each scaled to keep
+    its aspect ratio and centered in its cell — not dropped at a fixed spot
+    where they overlapped the bullets and each other."""
+    left, top, width, height = (int(v) for v in area)
+    cols = min(len(pictures), 3)
+    rows = math.ceil(len(pictures) / cols)
+    gap = int(Pt(8))
+    cell_w = (width - gap * (cols - 1)) / cols
+    cell_h = (height - gap * (rows - 1)) / rows
+    for k, (data, (px_w, px_h), alt) in enumerate(pictures):
+        if not px_w or not px_h:
+            continue
+        r, c = divmod(k, cols)
+        scale = min(cell_w / px_w, cell_h / px_h)
+        w, h = int(px_w * scale), int(px_h * scale)
+        x = int(left + c * (cell_w + gap) + (cell_w - w) / 2)
+        y = int(top + r * (cell_h + gap) + (cell_h - h) / 2)
+        try:
+            pic = slide.shapes.add_picture(io.BytesIO(data), Emu(x), Emu(y), Emu(w), Emu(h))
+            if alt:
+                pic._element.nvPicPr.cNvPr.set("descr", alt)
+        except Exception:
+            continue  # one bad image never costs the deck
+
+
+def _split_h(rect, fraction):
+    """Left `fraction` of a box and the remainder to its right, with a gutter."""
     left, top, width, height = rect
-    gutter = Pt(8)
-    upper = int(height * fraction)
-    return (left, top, width, Emu(upper)), (
-        left,
-        Emu(top + upper + gutter),
-        width,
-        Emu(height - upper - gutter),
-    )
+    gutter = int(Pt(16))
+    first = int(width * fraction)
+    return (left, top, first, height), (left + first + gutter, top, width - first - gutter, height)
 
 
-def build_pptx(slides: list, template=None) -> bytes:
+def _stack(area, bullets, table, code):
+    """Split `area` top-to-bottom among whichever of bullets/table/code the
+    slide has, in proportion to how much room each needs at a typical size,
+    so a two-line intro doesn't get half the slide above a long table."""
+    left, top, width, height = area
+    width_pt = _pt(width)
+    wanted = []
+    if bullets:
+        wanted.append(("bullets", _bullets_height(bullets, width_pt - INSET_X, 18) + INSET_Y))
+    if table:
+        wanted.append(("table", _table_height(table, width_pt, 14)))
+    if code:
+        wanted.append(("code", _code_size(code, (0, 0, width, height))[1]))
+    gutter = int(Pt(10))
+    usable = height - gutter * (len(wanted) - 1)
+    total = sum(_emu(w) for _, w in wanted) or 1
+    rects, y = {}, top
+    for key, w in wanted:
+        if len(wanted) == 1:
+            h = usable
+        elif total <= usable:
+            # Everything fits: each block gets what it needs plus some slack,
+            # top-aligned, rather than being stretched apart down the slide.
+            h = int(_emu(w) * min(usable / total, 1.4))
+        else:
+            h = int(usable * max(_emu(w) / total, 0.2))
+        rects[key] = (left, y, width, h)
+        y += h + gutter
+    # min-share bumps can overshoot; squeeze the last block back inside
+    key = wanted[-1][0]
+    l, t, w, h = rects[key]
+    rects[key] = (l, t, w, max(min(h, top + height - t), int(height * 0.15)))
+    return rects
+
+
+def _place_content(prs, slide, body, area, bullets, table, code, pictures) -> None:
+    main, pic_area = area, None
+    if pictures and (bullets or table or code):
+        main, pic_area = _split_h(area, 0.58)
+    elif pictures:
+        pic_area = area
+    rects = _stack(main, bullets, table, code) if (bullets or table or code) else {}
+
+    if bullets:
+        if body is not None and body.has_text_frame:
+            _set_rect(body, rects["bullets"])
+            _fill_bullets(body.text_frame, bullets, rects["bullets"])
+        else:  # layout has no body placeholder (e.g. picked by name)
+            box = slide.shapes.add_textbox(*rects["bullets"])
+            _fill_bullets(box.text_frame, bullets, rects["bullets"], glyphs=True)
+    elif body is not None:
+        _drop_shape(body)  # nothing to put in it; don't render an empty box
+    if table:
+        _add_table(slide, table, rects["table"])
+    if code:
+        _add_code(slide, code, rects["code"])
+    if pic_area is not None:
+        _add_pictures(slide, pictures, pic_area)
+
+
+def build_pptx(slides: list, template=None, *, images=None, allow_local_images=False) -> bytes:
     """Build a .pptx from parsed slides.
 
     template: optional .pptx/.potx as bytes, a stream, a path, or a
     Presentation. When given, the deck inherits that template's theme,
     fonts, and layouts, and each slide's 'layout' name is matched against the
     template's layouts. When omitted, the python-pptx default template is used.
+
+    images: optional {src: bytes} of image sources the caller already
+    resolved (the Action resolves Open WebUI file links this way).
+    allow_local_images: let <img src> name a local file — for the command-line
+    converter only; in Open WebUI that would read the server's filesystem.
     """
     prs = _as_presentation(template)
     _clear_slides(prs)
+    title_pt = _template_title_size(prs)
 
     for i, s in enumerate(slides):
-        text_bullets = [(lvl, t) for lvl, t in s["bullets"] if isinstance(t, str)]
-        image_bullets = [(lvl, t) for lvl, t in s["bullets"] if isinstance(t, dict)]
+        bullets = [(lvl, t) for lvl, t in s["bullets"] if isinstance(t, str)]
+        image_refs = [t for _, t in s["bullets"] if isinstance(t, dict)]
         table, code = s.get("table") or [], (s.get("code") or "").strip()
-        image_only = not text_bullets and not table and not code and image_bullets
-        is_title = i == 0 and not s["bullets"] and not table and not code
-
-        layout = _find_layout_by_name(prs, s.get("layout", ""))
-        if layout is None:
-            role = "title" if is_title else ("title_only" if image_only else "content")
-            layout = _pick_layout(prs, role)
-
-        ps = prs.slides.add_slide(layout)
-        _set_title(ps, s["title"])
-
-        if s["subtitle"]:
-            sub = _subtitle_placeholder(ps) or _body_placeholder(ps)
-            if sub is not None:
-                sub.text = s["subtitle"]
-
-        body, rect = _content_rect(prs, ps)
-        if text_bullets and body is not None and body.has_text_frame:
-            _fill_bullets(body.text_frame, text_bullets)
-            if table or code:
-                # Bullets keep the top of the box, the table/code takes the rest.
-                top_rect, rect = _split_rect(rect, 0.45)
-                body.height = top_rect[3]
-        elif (table or code) and body is not None:
-            _drop_shape(body)  # nothing to put in it; don't render an empty box
-        if table and code:
-            table_rect, rect = _split_rect(rect, 0.5)
+        has_body = bool(bullets or table or code or image_refs)
+        if not has_body:
+            role = "title" if i == 0 else "section"
+        elif not (bullets or table or code):
+            role = "title_only"  # images only: they get the whole content area
         else:
-            table_rect = rect
-        if table:
-            _add_table(ps, table, table_rect)
-        if code:
-            _add_code(ps, code, rect)
+            role = "content"
 
-        for _, img in image_bullets:
-            data = _fetch_image(img["image"])
-            if data is not None:
-                ps.shapes.add_picture(data, Pt(60), Pt(120), height=Pt(340))
+        layout = _find_layout_by_name(prs, s.get("layout", "")) or _pick_layout(prs, role)
+        ps = prs.slides.add_slide(layout)
+        _set_title(ps, s["title"], title_pt)
+
+        subtitle_ph = _subtitle_placeholder(ps)
+        if role in ("title", "section"):
+            target = subtitle_ph or _body_placeholder(ps)
+            if s["subtitle"] and target is not None and target.has_text_frame:
+                target.text_frame.text = s["subtitle"]
+        else:
+            body, area = _content_area(prs, ps)
+            if s["subtitle"]:
+                if subtitle_ph is not None:
+                    subtitle_ph.text_frame.text = s["subtitle"]
+                else:
+                    area = _add_lead(ps, s["subtitle"], area)
+            pictures = []
+            for ref in image_refs:
+                loaded = _load_image(ref.get("image"), images, allow_local_images)
+                if loaded:
+                    pictures.append((loaded[0], loaded[1], ref.get("alt", "")))
+            _place_content(prs, ps, body, area, bullets, table, code, pictures)
 
         if s["notes"]:
             ps.notes_slide.notes_text_frame.text = s["notes"]
+        _drop_empty_placeholders(ps)
 
     buf = io.BytesIO()
     prs.save(buf)

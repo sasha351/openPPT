@@ -3,6 +3,7 @@ import io
 import openppt_action
 
 from pptx import Presentation
+from pptx.util import Pt
 
 from openppt_action import (
     APPENDIX_MARKER,
@@ -280,13 +281,198 @@ def test_short_title_keeps_the_templates_own_size():
 
 
 def test_dense_bullet_list_shrinks():
-    items = "".join(f"<li>point {i}</li>" for i in range(14))
+    items = "".join(f"<li>point {i}</li>" for i in range(20))
     out = Presentation(
         io.BytesIO(build_pptx(parse_outline(f'<slide title="Ideas"><ul>{items}</ul></slide>')))
     )
     (body,) = [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
-    assert len(body.text_frame.paragraphs) == 14
+    assert len(body.text_frame.paragraphs) == 20
     assert all(p.font.size.pt <= 14 for p in body.text_frame.paragraphs)
+    # the size is on the runs too: PowerPoint renders a run's own size and
+    # ignores a paragraph-level default for runs that already exist
+    assert all(r.font.size.pt <= 14 for p in body.text_frame.paragraphs for r in p.runs)
+
+
+def test_sparse_bullet_list_stays_readable():
+    """Three short bullets used to be set at 20pt, leaving the slide empty."""
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(
+        '<slide title="T"><ul><li>One</li><li>Two</li><li>Three</li></ul></slide>'
+    ))))
+    (body,) = [p for p in out.slides[0].placeholders if p.placeholder_format.idx == 1]
+    assert all(p.font.size.pt >= 24 for p in body.text_frame.paragraphs)
+
+
+def _shapes_inside_slide(prs, slide):
+    for shape in slide.shapes:
+        assert shape.left >= 0 and shape.top >= 0, shape.name
+        assert shape.left + shape.width <= prs.slide_width + 1, shape.name
+        assert shape.top + shape.height <= prs.slide_height + 1, shape.name
+
+
+def test_bullets_keep_their_width_next_to_a_code_block():
+    """Shrinking the body by setting only its height wrote width 0, so every
+    slide mixing bullets with a table or code lost its bullets."""
+    out = Presentation(io.BytesIO(build_pptx(parse_outline(
+        '<slide title="Deploy"><ul><li>Run the script</li></ul>'
+        "<pre><code>make ship</code></pre></slide>"
+    ))))
+    slide = out.slides[0]
+    (body,) = [p for p in slide.placeholders if p.placeholder_format.idx == 1]
+    layout_body = [p for p in slide.slide_layout.placeholders if p.placeholder_format.idx == 1][0]
+    assert body.width == layout_body.width and body.left == layout_body.left
+    assert body.top == layout_body.top and 0 < body.height < layout_body.height
+    (code,) = [s for s in slide.shapes if s.has_text_frame and "make ship" in s.text_frame.text]
+    assert code.top >= body.top + body.height
+    _shapes_inside_slide(out, slide)
+
+
+def _png(w, h):
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), (200, 30, 30)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_a_non_image_src_never_aborts_the_export():
+    """An <img> pointing at a text file or HTML page used to raise out of
+    add_picture and fail the whole deck."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".png", delete=False) as fh:
+        fh.write("not an image")
+    outline = f'<slide title="Photo"><img src="{fh.name}" alt="x"><li>caption</li></slide>'
+    for local in (False, True):
+        out = Presentation(io.BytesIO(
+            build_pptx(parse_outline(outline), allow_local_images=local)
+        ))
+        assert not [s for s in out.slides[0].shapes if s.shape_type == 13]
+
+
+def test_local_paths_only_load_when_allowed():
+    """In Open WebUI a local path is the server's filesystem — the outline is
+    model output, so it must not be able to pull arbitrary server files in."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+        fh.write(_png(40, 20))
+    outline = f'<slide title="Photo"><img src="{fh.name}" alt="x"></slide>'
+    blocked = Presentation(io.BytesIO(build_pptx(parse_outline(outline))))
+    assert not [s for s in blocked.slides[0].shapes if s.shape_type == 13]
+    allowed = Presentation(io.BytesIO(build_pptx(parse_outline(outline), allow_local_images=True)))
+    assert [s for s in allowed.slides[0].shapes if s.shape_type == 13]
+
+
+def test_private_network_image_urls_are_not_fetched():
+    from openppt_action import _load_image, _public_host
+
+    assert not _public_host("127.0.0.1")
+    assert not _public_host("169.254.169.254")  # cloud metadata endpoint
+    assert not _public_host("10.0.0.5")
+    assert not _public_host("localhost")
+    assert _load_image("http://127.0.0.1:9/x.png") is None
+
+
+def test_data_uri_and_prefetched_images_embed_side_by_side():
+    import base64
+
+    uri = "data:image/png;base64," + base64.b64encode(_png(400, 200)).decode()
+    outline = (
+        f'<slide title="Two"><img src="{uri}" alt="wide">'
+        '<img src="/api/v1/files/abc/content" alt="tall"></slide>'
+    )
+    data = build_pptx(parse_outline(outline), images={"/api/v1/files/abc/content": _png(100, 300)})
+    prs = Presentation(io.BytesIO(data))
+    slide = prs.slides[0]
+    pics = [s for s in slide.shapes if s.shape_type == 13]
+    assert len(pics) == 2
+    wide, tall = pics
+    # aspect ratio kept
+    assert abs(wide.width / wide.height - 2.0) < 0.02
+    assert abs(tall.width / tall.height - 1 / 3) < 0.02
+    # no overlap, all on the slide
+    assert wide.left + wide.width <= tall.left or tall.left + tall.width <= wide.left
+    _shapes_inside_slide(prs, slide)
+    assert wide._element.nvPicPr.cNvPr.get("descr") == "wide"
+
+
+def test_images_sit_beside_bullets_not_on_top_of_them():
+    import base64
+
+    uri = "data:image/png;base64," + base64.b64encode(_png(300, 300)).decode()
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(
+        f'<slide title="T"><ul><li>point one</li><li>point two</li></ul><img src="{uri}"></slide>'
+    ))))
+    slide = prs.slides[0]
+    (pic,) = [s for s in slide.shapes if s.shape_type == 13]
+    (body,) = [p for p in slide.placeholders if p.placeholder_format.idx == 1]
+    assert body.left + body.width <= pic.left
+    _shapes_inside_slide(prs, slide)
+
+
+def test_image_only_slide_keeps_its_title():
+    """_body_placeholder matched by Python id(), which never matches a fresh
+    python-pptx proxy — so on a Title Only layout it returned the title as the
+    'body', the images were laid over it, and the title was dropped."""
+    import base64
+
+    uri = "data:image/png;base64," + base64.b64encode(_png(300, 200)).decode()
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(
+        f'<slide title="Deck"></slide><slide title="Team"><img src="{uri}"></slide>'
+    ))))
+    slide = prs.slides[1]
+    assert slide.shapes.title is not None and slide.shapes.title.text == "Team"
+    (pic,) = [s for s in slide.shapes if s.shape_type == 13]
+    assert pic.top >= slide.shapes.title.top + slide.shapes.title.height
+    _shapes_inside_slide(prs, slide)
+
+
+def test_content_slide_subtitle_is_kept():
+    """It used to be written into the body, then overwritten by bullet one."""
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(
+        '<slide title="Intro"></slide>'
+        '<slide title="T" subtitle="Why it matters"><li>one</li><li>two</li></slide>'
+    ))))
+    texts = [s.text_frame.text for s in prs.slides[1].shapes if s.has_text_frame]
+    assert "Why it matters" in texts
+    assert any("one" in t and "two" in t for t in texts)
+    _shapes_inside_slide(prs, prs.slides[1])
+
+
+def test_no_empty_placeholder_is_left_behind():
+    """An unfilled placeholder shows as 'Click to add text' in PowerPoint."""
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(
+        '<slide title="Deck"></slide>'
+        '<slide title="Next" layout="Two Content"><li>a</li></slide>'
+        '<slide title="Section break"></slide>'
+        '<slide title="Code only"><pre>x = 1</pre></slide>'
+    ))))
+    for slide in prs.slides:
+        for ph in slide.placeholders:
+            assert ph.text_frame.text.strip(), (slide.slide_layout.name, ph.name)
+
+
+def test_empty_later_slide_becomes_a_section_divider():
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(
+        '<slide title="Deck"></slide>'
+        '<slide title="Part two" subtitle="Rollout"></slide>'
+        '<slide title="Body"><li>x</li></slide>'
+    ))))
+    divider = prs.slides[1]
+    assert divider.slide_layout.name == "Section Header"
+    texts = [s.text_frame.text for s in divider.shapes if s.has_text_frame]
+    assert "Part two" in texts and "Rollout" in texts
+
+
+def test_table_rows_size_to_their_text():
+    """Rows used to be stretched to fill the whole content area."""
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(TABLE_OUTLINE))))
+    slide = prs.slides[0]
+    (shape,) = [s for s in slide.shapes if s.has_table]
+    rows = list(shape.table.rows)
+    assert all(r.height < Pt(60) for r in rows)
+    assert sum(c.width for c in shape.table.columns) == shape.width
+    _shapes_inside_slide(prs, slide)
 
 
 def test_find_layout_by_name_is_fuzzy():
