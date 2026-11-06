@@ -58,8 +58,10 @@ def test_parse_outline():
         "layout": "",
         "notes": "",
         "bullets": [],
+        "runs": [],
         "table": [],
         "code": "",
+        "columns": [],
     }
     assert slides[1]["bullets"] == [
         (0, "Launched EU region"),
@@ -553,6 +555,98 @@ TABLE_OUTLINE = """<slide title="Q3 Numbers">
 </table>
 </slide>
 """
+
+
+COLUMNS_OUTLINE = """<slide title="Build vs buy">
+<p>Decision due Friday</p>
+<column heading="Build"><ul><li>Full control</li><li>6 months</li></ul></column>
+<column heading="Buy"><ul><li><b>Live in 2 weeks</b></li><li>$40k/yr</li></ul></column>
+</slide>"""
+
+
+def test_parse_columns():
+    (slide,) = parse_outline(COLUMNS_OUTLINE)
+    assert slide["bullets"] == [(0, "Decision due Friday")]
+    assert [c["heading"] for c in slide["columns"]] == ["Build", "Buy"]
+    assert slide["columns"][0]["bullets"] == [(0, "Full control"), (0, "6 months")]
+    assert slide["columns"][1]["bullets"] == [(0, "Live in 2 weeks"), (0, "$40k/yr")]
+    assert slide["columns"][1]["runs"][0] == [("Live in 2 weeks", ("b",))]
+
+
+def test_unclosed_column_is_closed_by_the_next_one():
+    (slide,) = parse_outline(
+        '<slide title="T"><col heading="A"><li>a1<col heading="B"><li>b1</slide>'
+    )
+    assert [c["bullets"] for c in slide["columns"]] == [[(0, "a1")], [(0, "b1")]]
+
+
+def test_col_inside_a_table_is_not_a_column():
+    (slide,) = parse_outline(
+        '<slide title="T"><table><colgroup><col></colgroup>'
+        "<tr><td>x</td></tr></table></slide>"
+    )
+    assert slide["columns"] == [] and slide["table"] == [["x"]]
+
+
+def test_build_renders_columns_into_the_two_content_layout():
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(COLUMNS_OUTLINE))))
+    slide = prs.slides[0]
+    assert slide.slide_layout.name == "Two Content"
+    bodies = sorted(
+        (p for p in slide.placeholders if p.placeholder_format.type in (2, 7)),
+        key=lambda p: p.left,
+    )
+    assert [b.text_frame.paragraphs[0].text for b in bodies] == ["Build", "Buy"]
+    assert bodies[0].left + bodies[0].width <= bodies[1].left
+    assert "Full control" in bodies[0].text_frame.text
+    assert "$40k/yr" in bodies[1].text_frame.text
+    # the slide-level line sits above both columns
+    (intro,) = [s for s in slide.shapes if s.has_text_frame and s.text_frame.text == "Decision due Friday"]
+    assert intro.top + intro.height <= bodies[0].top
+    # headings are bold and bullet-less
+    heading = bodies[0].text_frame.paragraphs[0]
+    assert heading.runs[0].font.bold and heading._p.pPr.find(
+        "{http://schemas.openxmlformats.org/drawingml/2006/main}buNone"
+    ) is not None
+    _shapes_inside_slide(prs, slide)
+
+
+def test_columns_fall_back_to_text_boxes_without_a_matching_layout():
+    three = (
+        '<slide title="T"><column heading="A"><li>a</li></column>'
+        '<column heading="B"><li>b</li></column><column heading="C"><li>c</li></column></slide>'
+    )
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(three))))
+    slide = prs.slides[0]
+    texts = [s.text_frame.text for s in slide.shapes if s.has_text_frame]
+    for col in ("A\na", "B\nb", "C\nc"):
+        assert col in texts, texts
+    _shapes_inside_slide(prs, slide)
+
+
+def test_inline_formatting_survives_as_runs():
+    (slide,) = parse_outline(
+        '<slide title="T"><ul><li>Ship <b>billing v2</b> by <i>March</i>, run <code>make ship</code></li>'
+        "<li>plain</li></ul></slide>"
+    )
+    assert slide["bullets"] == [(0, "Ship billing v2 by March, run make ship"), (0, "plain")]
+    assert slide["runs"][1] is None
+    prs = Presentation(io.BytesIO(build_pptx([slide])))
+    (body,) = [p for p in prs.slides[0].placeholders if p.placeholder_format.idx == 1]
+    runs = {r.text: r for r in body.text_frame.paragraphs[0].runs}
+    assert runs["billing v2"].font.bold and not runs["Ship "].font.bold
+    assert runs["March"].font.italic
+    assert runs["make ship"].font.name == "Consolas"
+
+
+def test_bare_lines_become_separate_bullets():
+    (slide,) = parse_outline('<slide title="T">\nFirst point\nSecond <b>point</b>\n</slide>')
+    assert slide["bullets"] == [(0, "First point"), (0, "Second point")]
+
+
+def test_line_breaks_inside_a_bullet_are_spaces():
+    (slide,) = parse_outline('<slide title="T"><li>wrapped\n   across lines<br>and a br</li></slide>')
+    assert slide["bullets"] == [(0, "wrapped across lines and a br")]
 
 
 def test_parse_table():

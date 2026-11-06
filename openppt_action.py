@@ -66,8 +66,10 @@ def _new_slide(title: str, layout: str = "") -> dict:
         "layout": layout,
         "notes": "",
         "bullets": [],
+        "runs": [],
         "table": [],
         "code": "",
+        "columns": [],
     }
 
 
@@ -75,19 +77,48 @@ def _attr(attrs: dict, name: str) -> str:
     return (attrs.get(name) or "").strip()
 
 
+# Inline tags kept as formatting on the bullet's text runs.
+INLINE_FORMATS = {"b": "b", "strong": "b", "i": "i", "em": "i", "u": "u", "code": "code"}
+COLUMN_TAGS = ("column", "col")
+
+
+def _normalize_runs(pieces) -> list:
+    """[(text, formats)] → whitespace collapsed (HTML semantics: a line break
+    inside an '<li>' is just a space), ends trimmed, same-format neighbours
+    merged, empties dropped."""
+    out = []
+    for text, fmt in pieces:
+        text = re.sub(r"\s+", " ", text)
+        if out and out[-1][0].endswith(" ") and text.startswith(" "):
+            text = text[1:]
+        if not text:
+            continue
+        if out and out[-1][1] == fmt:
+            out[-1] = (out[-1][0] + text, fmt)
+        else:
+            out.append((text, fmt))
+    while out and not out[0][0].strip():
+        out.pop(0)
+    while out and not out[-1][0].strip():
+        out.pop()
+    if out:
+        out[0] = (out[0][0].lstrip(), out[0][1])
+        out[-1] = (out[-1][0].rstrip(), out[-1][1])
+    return [(t, f) for t, f in out if t]
+
+
 class _OutlineParser(HTMLParser):
-    """Turns a stream of tag events into the same slide-dict shape the old
-    Markdown parser produced, so build_pptx and everything downstream needs
-    no changes.
+    """Turns a stream of tag events into slide dicts for build_pptx.
 
     Deliberately tolerant rather than a strict-HTML validator, because local
     models don't emit strict HTML any more reliably than they emitted strict
-    Markdown: unclosed '<slide>'/'<li>'/'<p>' tags are auto-closed, stray text
-    directly inside '<slide>' (not wrapped in '<p>'/'<li>') still becomes a
-    bullet instead of being dropped, and '<blockquote>' is accepted as a
-    synonym for '<notes>'. HTMLParser itself is already lenient about
-    malformed markup (mismatched tags, missing quotes, bad nesting) and never
-    raises on it, which is most of why HTML beats hand-rolled regex here.
+    Markdown: unclosed '<slide>'/'<li>'/'<p>'/'<column>' tags are auto-closed,
+    stray text directly inside '<slide>' (not wrapped in '<p>'/'<li>') still
+    becomes bullets — one per line — instead of being dropped, and
+    '<blockquote>' is accepted as a synonym for '<notes>'. HTMLParser itself
+    is already lenient about malformed markup (mismatched tags, missing
+    quotes, bad nesting) and never raises on it, which is most of why HTML
+    beats hand-rolled regex here.
     """
 
     def __init__(self):
@@ -100,33 +131,83 @@ class _OutlineParser(HTMLParser):
 
     def _reset_slide_state(self):
         self.list_depth = 0
-        self.li_stack = []  # [{"level", "buf": [str], "image": dict|None, "emitted": bool}]
+        self.li_stack = []  # [{"level", "buf": [(str, fmt)], "image": dict|None, "emitted": bool}]
         self.pre_depth = 0
         self.code_buf = []
         self.notes_depth = 0
         self.notes_buf = []
         self.p_depth = 0
         self.p_buf = []
+        self.bare_buf = []
         self.table = None
         self.row = None
         self.cell_depth = 0
         self.cell_buf = []
+        self.column = None
+        self.fmt = {"b": 0, "i": 0, "u": 0, "code": 0}
 
-    def _close_slide(self):
-        """Flush whatever was still open (unclosed li/p/notes/table/pre) and
-        end the current slide — called on '</slide>', on a new '<slide>'
-        opening without a previous close, and at end-of-document."""
+    # -- emitting ---------------------------------------------------------
+    def _target(self):
+        """Where bullets go: the open '<column>', else the slide itself."""
+        return self.column if self.column is not None else self.current
+
+    def _emit(self, level, pieces):
+        runs = _normalize_runs(pieces)
+        text = "".join(t for t, _ in runs)
+        if not text:
+            return
+        target = self._target()
+        target["bullets"].append((level, text))
+        # Formatting rides alongside, so (level, text) bullets stay plain.
+        target["runs"].append(runs if any(f for _, f in runs) else None)
+
+    def _emit_image(self, level, image):
+        target = self._target()
+        target["bullets"].append((level, image))
+        target["runs"].append(None)
+
+    def _emit_frame(self, frame):
+        if frame["emitted"]:
+            return
+        if frame["image"] is not None:
+            self._emit_image(frame["level"], frame["image"])
+        self._emit(frame["level"], frame["buf"])
+        frame["buf"], frame["emitted"] = [], True
+
+    def _flush_bare(self):
+        """Bare text directly inside '<slide>' — models forget the '<li>'
+        wrapper constantly — becomes one bullet per line."""
+        line = []
+        for text, fmt in self.bare_buf:
+            parts = text.split("\n")
+            for k, part in enumerate(parts):
+                if k:
+                    self._emit(0, line)
+                    line = []
+                line.append((part, fmt))
+        self._emit(0, line)
+        self.bare_buf = []
+
+    def _flush_blocks(self):
+        """Close whatever list item / paragraph / bare text is still open —
+        before a column starts or ends, and when the slide does."""
+        self._flush_bare()
         while self.li_stack:
             frame = self.li_stack.pop()
-            if not frame["emitted"] and frame["image"] is not None:
-                self.current["bullets"].append((frame["level"], frame["image"]))
-            text = "".join(frame["buf"]).strip()
-            if text:
-                self.current["bullets"].append((frame["level"], text))
+            if frame["image"] is not None and not frame["emitted"]:
+                self._emit_image(frame["level"], frame["image"])
+            if not frame["emitted"] or frame["buf"]:
+                self._emit(frame["level"], frame["buf"])
+        self.list_depth = 0
         if self.p_depth > 0:
-            text = "".join(self.p_buf).strip()
-            if text:
-                self.current["bullets"].append((0, text))
+            self._emit(0, self.p_buf)
+            self.p_depth, self.p_buf = 0, []
+
+    def _close_slide(self):
+        """Flush whatever was still open (unclosed li/p/column/notes/table/
+        pre) and end the current slide — called on '</slide>', on a new
+        '<slide>' opening without a previous close, and at end-of-document."""
+        self._flush_blocks()
         if self.notes_depth > 0:
             text = "".join(self.notes_buf).strip()
             if text:
@@ -141,6 +222,7 @@ class _OutlineParser(HTMLParser):
         self.in_slide = False
         self.current = None
 
+    # -- HTMLParser callbacks ---------------------------------------------
     def handle_comment(self, data):
         if data.strip() == "openppt":
             self.stopped = True  # hard stop: never parse openPPT's own appendix
@@ -154,6 +236,7 @@ class _OutlineParser(HTMLParser):
                 self.code_buf.append(self.get_starttag_text())
             return
         if tag == "pre":
+            self._flush_bare()
             self.pre_depth += 1
             return
         if tag == "slide":
@@ -166,22 +249,24 @@ class _OutlineParser(HTMLParser):
             return
         if not self.in_slide:
             return  # stray tag before the first '<slide>' — ignore
-        if tag in ("ul", "ol"):
+        if tag in INLINE_FORMATS:
+            self.fmt[INLINE_FORMATS[tag]] += 1
+            return
+        if tag == "br":
+            self.handle_data("\n")  # a line break: a space in a bullet, a new bare line
+            return
+        self._flush_bare()
+        if tag in COLUMN_TAGS and self.table is None:  # '<col>' in a table is HTML's own
+            self._flush_blocks()
+            self.column = {"heading": _attr(a, "heading") or _attr(a, "title"), "bullets": [], "runs": []}
+            self.current["columns"].append(self.column)
+        elif tag in ("ul", "ol"):
             if self.li_stack:
                 # A nested list inside a still-open '<li>' — flush that li's
                 # own text now, in document order, rather than waiting for its
                 # '</li>' (which comes after the nested list closes and would
                 # put the parent's text after its children's).
-                top = self.li_stack[-1]
-                if not top["emitted"]:
-                    if top["image"] is not None:
-                        self.current["bullets"].append((top["level"], top["image"]))
-                    else:
-                        text = "".join(top["buf"]).strip()
-                        if text:
-                            self.current["bullets"].append((top["level"], text))
-                    top["buf"] = []
-                    top["emitted"] = True
+                self._emit_frame(self.li_stack[-1])
             self.list_depth += 1
         elif tag == "li":
             level = min(self.list_depth - 1, 4) if self.list_depth > 0 else 0
@@ -193,7 +278,7 @@ class _OutlineParser(HTMLParser):
             if self.li_stack:
                 self.li_stack[-1]["image"] = image
             else:
-                self.current["bullets"].append((0, image))
+                self._emit_image(0, image)
         elif tag in ("notes", "blockquote"):
             self.notes_depth += 1
         elif tag == "p":
@@ -224,16 +309,22 @@ class _OutlineParser(HTMLParser):
             return
         if not self.in_slide:
             return
-        if tag in ("ul", "ol"):
+        if tag in INLINE_FORMATS:
+            key = INLINE_FORMATS[tag]
+            self.fmt[key] = max(0, self.fmt[key] - 1)
+            return
+        self._flush_bare()
+        if tag in COLUMN_TAGS and self.table is None:
+            self._flush_blocks()
+            self.column = None
+        elif tag in ("ul", "ol"):
             self.list_depth = max(0, self.list_depth - 1)
         elif tag == "li":
             if self.li_stack:
                 frame = self.li_stack.pop()
-                if not frame["emitted"] and frame["image"] is not None:
-                    self.current["bullets"].append((frame["level"], frame["image"]))
-                text = "".join(frame["buf"]).strip()
-                if text:
-                    self.current["bullets"].append((frame["level"], text))
+                if frame["image"] is not None and not frame["emitted"]:
+                    self._emit_image(frame["level"], frame["image"])
+                self._emit(frame["level"], frame["buf"])
         elif tag in ("notes", "blockquote"):
             self.notes_depth = max(0, self.notes_depth - 1)
             if self.notes_depth == 0:
@@ -244,10 +335,8 @@ class _OutlineParser(HTMLParser):
         elif tag == "p":
             self.p_depth = max(0, self.p_depth - 1)
             if self.p_depth == 0:
-                text = "".join(self.p_buf).strip()
+                self._emit(0, self.p_buf)
                 self.p_buf = []
-                if text:
-                    self.current["bullets"].append((0, text))
         elif tag == "table":
             if self.table is not None:
                 self.current["table"].extend(self.table)
@@ -259,7 +348,7 @@ class _OutlineParser(HTMLParser):
         elif tag in ("td", "th"):
             if self.cell_depth > 0:
                 self.cell_depth -= 1
-                text = "".join(self.cell_buf).strip()
+                text = re.sub(r"\s+", " ", "".join(self.cell_buf)).strip()
                 self.cell_buf = []
                 if self.row is not None:
                     self.row.append(text)
@@ -267,23 +356,19 @@ class _OutlineParser(HTMLParser):
     def handle_data(self, data):
         if self.stopped or not self.in_slide:
             return
+        fmt = tuple(sorted(k for k, v in self.fmt.items() if v > 0))
         if self.pre_depth > 0:
             self.code_buf.append(data)
         elif self.cell_depth > 0:
             self.cell_buf.append(data)
         elif self.li_stack:
-            self.li_stack[-1]["buf"].append(data)
+            self.li_stack[-1]["buf"].append((data, fmt))
         elif self.p_depth > 0:
-            self.p_buf.append(data)
+            self.p_buf.append((data, fmt))
         elif self.notes_depth > 0:
             self.notes_buf.append(data)
         else:
-            # Bare text directly inside '<slide>', not wrapped in '<p>'/'<li>'
-            # — models forget the wrapper constantly, so treat it as a bullet
-            # rather than silently dropping the content.
-            text = data.strip()
-            if text:
-                self.current["bullets"].append((0, text))
+            self.bare_buf.append((data, fmt))
 
 
 def _extract_fences(text: str) -> str:
@@ -799,12 +884,53 @@ def _bullet_glyph(paragraph, level: int) -> None:
     _insert_bullet_props(paragraph, pPr.makeelement(qn("a:buChar"), {"char": "•"}))
 
 
-def _fill_bullets(text_frame, bullets, rect, glyphs: bool = False) -> float:
-    _fit(text_frame)
-    size = _body_size(bullets, rect)
-    for j, (level, text) in enumerate(bullets):
-        p = text_frame.paragraphs[0] if j == 0 else text_frame.add_paragraph()
+def _text_items(bullets, runs=None):
+    """The text bullets of a slide or column, with their formatting runs
+    aligned (image bullets are placed separately)."""
+    runs = list(runs or [])
+    runs += [None] * (len(bullets) - len(runs))
+    pairs = [(b, r) for b, r in zip(bullets, runs) if isinstance(b[1], str)]
+    return [b for b, _ in pairs], [r for _, r in pairs]
+
+
+def _write_runs(p, text, runs) -> None:
+    """Paragraph text, keeping <b>/<i>/<u>/<code> as run formatting."""
+    if not runs:
         p.text = text
+        return
+    for chunk, fmt in runs:
+        run = p.add_run()
+        run.text = chunk
+        if "b" in fmt:
+            run.font.bold = True
+        if "i" in fmt:
+            run.font.italic = True
+        if "u" in fmt:
+            run.font.underline = True
+        if "code" in fmt:
+            run.font.name = "Consolas"
+
+
+def _fill_bullets(text_frame, bullets, rect, glyphs=False, runs=None, heading="") -> float:
+    """Write bullets into a text frame at the largest size that fits `rect`.
+    `heading` (a column's) goes first as a bold, bullet-less line."""
+    _fit(text_frame)
+    sized = ([(0, heading)] if heading else []) + list(bullets)
+    size = _body_size(sized, rect)
+    runs = list(runs or []) + [None] * len(bullets)
+    j = 0
+    if heading:
+        p = text_frame.paragraphs[0]
+        p.text = heading
+        _no_bullet(p)
+        _size_paragraph(p, size + 2)
+        for run in p.runs:
+            run.font.bold = True
+        j = 1
+    for k, (level, text) in enumerate(bullets):
+        p = text_frame.paragraphs[0] if j == 0 else text_frame.add_paragraph()
+        j += 1
+        _write_runs(p, text, runs[k])
         p.level = level
         _size_paragraph(p, _level_size(size, level))
         if glyphs:
@@ -977,17 +1103,32 @@ def _split_h(rect, fraction):
     return (left, top, first, height), (left + first + gutter, top, width - first - gutter, height)
 
 
-def _stack(area, bullets, table, code):
-    """Split `area` top-to-bottom among whichever of bullets/table/code the
-    slide has, in proportion to how much room each needs at a typical size,
-    so a two-line intro doesn't get half the slide above a long table."""
+def _columns_height(columns, width_pt: float, size: float) -> float:
+    n = max(len(columns), 1)
+    col_pt = (width_pt - 18 * (n - 1)) / n - INSET_X
+    return max(
+        _bullets_height(
+            ([(0, c["heading"])] if c["heading"] else []) + c["text"], col_pt, size
+        ) + (120 if c["pictures"] else 0)
+        for c in columns
+    ) + INSET_Y
+
+
+def _stack(area, bullets, table, code, columns=()):
+    """Split `area` top-to-bottom among whichever of bullets/columns/table/
+    code the slide has, in proportion to how much room each needs at a typical
+    size, so a two-line intro doesn't get half the slide above a long table."""
     left, top, width, height = area
     width_pt = _pt(width)
     wanted = []
+    # Text is budgeted at a comfortable 22pt (tables at 18pt): when there's
+    # room, each block's own fit then lands near that, not at a cramped size.
     if bullets:
-        wanted.append(("bullets", _bullets_height(bullets, width_pt - INSET_X, 18) + INSET_Y))
+        wanted.append(("bullets", _bullets_height(bullets, width_pt - INSET_X, 22) + INSET_Y))
+    if columns:
+        wanted.append(("columns", _columns_height(columns, width_pt, 22)))
     if table:
-        wanted.append(("table", _table_height(table, width_pt, 14)))
+        wanted.append(("table", _table_height(table, width_pt, 18)))
     if code:
         wanted.append(("code", _code_size(code, (0, 0, width, height))[1]))
     gutter = int(Pt(10))
@@ -1012,23 +1153,86 @@ def _stack(area, bullets, table, code):
     return rects
 
 
-def _place_content(prs, slide, body, area, bullets, table, code, pictures) -> None:
+def _columns_layout(prs, n: int):
+    """A layout with `n` body placeholders side by side (e.g. 'Two Content'),
+    by placeholder count rather than name; else the ordinary content layout."""
+    scored = [(lay, _layout_stats(lay)) for lay in prs.slide_layouts]
+    for exact in (True, False):
+        for lay, s in scored:
+            if s["title"] and not s["subtitle"] and (
+                s["body"] == n if exact else s["body"] >= n
+            ):
+                return lay
+    return _pick_layout(prs, "content")
+
+
+def _body_union(prs, slide):
+    """The box spanning every body placeholder — for a two-column layout,
+    both columns — or the free area under the title when there are none."""
+    bodies = [ph for ph in slide.placeholders if _ph_type(ph) in BODY_TYPES and ph.width]
+    if not bodies:
+        return _free_rect(prs, slide)
+    left = min(b.left for b in bodies)
+    top = min(b.top for b in bodies)
+    right = max(b.left + b.width for b in bodies)
+    bottom = max(b.top + b.height for b in bodies)
+    return (left, top, right - left, bottom - top)
+
+
+def _place_columns(slide, columns, area, placeholders) -> None:
+    """Side-by-side columns, filled into the layout's own body placeholders
+    (so a template's column styling applies) where it has enough, else into
+    text boxes. Each column: heading, bullets, then any images below."""
+    left, top, width, height = (int(v) for v in area)
+    n = len(columns)
+    gutter = int(Pt(18))
+    col_w = (width - gutter * (n - 1)) // n
+    placeholders = sorted(placeholders, key=lambda ph: ph.left or 0)
+    for k, col in enumerate(columns):
+        rect = (left + k * (col_w + gutter), top, col_w, height)
+        text_rect, pic_rect = rect, None
+        has_text = bool(col["text"] or col["heading"])
+        if col["pictures"] and has_text:
+            upper = int(height * 0.55)
+            text_rect = (rect[0], top, col_w, upper)
+            pic_rect = (rect[0], top + upper + int(Pt(8)), col_w, height - upper - int(Pt(8)))
+        elif col["pictures"]:
+            pic_rect = rect
+        if has_text:
+            ph = placeholders[k] if k < len(placeholders) else None
+            if ph is not None and ph.has_text_frame:
+                _set_rect(ph, text_rect)
+                frame, glyphs = ph.text_frame, False
+            else:
+                frame, glyphs = slide.shapes.add_textbox(*text_rect).text_frame, True
+            _fill_bullets(frame, col["text"], text_rect, glyphs, col["runs"], col["heading"])
+        if pic_rect is not None:
+            _add_pictures(slide, col["pictures"], pic_rect)
+
+
+def _place_content(prs, slide, body, area, bullets, table, code, pictures,
+                   runs=None, columns=()) -> None:
     main, pic_area = area, None
-    if pictures and (bullets or table or code):
+    if pictures and (bullets or table or code or columns):
         main, pic_area = _split_h(area, 0.58)
     elif pictures:
         pic_area = area
-    rects = _stack(main, bullets, table, code) if (bullets or table or code) else {}
+    has_main = bool(bullets or table or code or columns)
+    rects = _stack(main, bullets, table, code, columns) if has_main else {}
+    # A column slide's body placeholders belong to its columns.
+    col_phs = [ph for ph in slide.placeholders if _ph_type(ph) in BODY_TYPES] if columns else []
 
     if bullets:
-        if body is not None and body.has_text_frame:
+        if body is not None and body.has_text_frame and not columns:
             _set_rect(body, rects["bullets"])
-            _fill_bullets(body.text_frame, bullets, rects["bullets"])
-        else:  # layout has no body placeholder (e.g. picked by name)
+            _fill_bullets(body.text_frame, bullets, rects["bullets"], runs=runs)
+        else:  # layout has no free body placeholder (e.g. picked by name)
             box = slide.shapes.add_textbox(*rects["bullets"])
-            _fill_bullets(box.text_frame, bullets, rects["bullets"], glyphs=True)
-    elif body is not None:
+            _fill_bullets(box.text_frame, bullets, rects["bullets"], glyphs=True, runs=runs)
+    elif body is not None and not columns:
         _drop_shape(body)  # nothing to put in it; don't render an empty box
+    if columns:
+        _place_columns(slide, columns, rects["columns"], col_phs)
     if table:
         _add_table(slide, table, rects["table"])
     if code:
@@ -1274,18 +1478,44 @@ def build_pptx(
     title_pt = _template_title_size(prs)
 
     for i, s in enumerate(slides):
-        bullets = [(lvl, t) for lvl, t in s["bullets"] if isinstance(t, str)]
+        bullets, runs = _text_items(s["bullets"], s.get("runs"))
         image_refs = [t for _, t in s["bullets"] if isinstance(t, dict)]
         table, code = s.get("table") or [], (s.get("code") or "").strip()
-        has_body = bool(bullets or table or code or image_refs)
+
+        def pictures_of(refs):
+            loaded = [(_load_image(r.get("image"), images, allow_local_images), r) for r in refs]
+            return [(data, size, r.get("alt", "")) for (data, size), r in
+                    ((l, r) for l, r in loaded if l)]
+
+        columns = []
+        for col in s.get("columns") or []:
+            text, col_runs = _text_items(col.get("bullets", []), col.get("runs"))
+            refs = [t for _, t in col.get("bullets", []) if isinstance(t, dict)]
+            if text or refs or col.get("heading"):
+                columns.append({
+                    "heading": col.get("heading", ""), "text": text,
+                    "runs": col_runs, "pictures": pictures_of(refs),
+                })
+        if len(columns) == 1:  # one "column" is just more bullets
+            col = columns.pop()
+            if col["heading"]:
+                bullets, runs = bullets + [(0, col["heading"])], runs + [[(col["heading"], ("b",))]]
+            bullets, runs = bullets + col["text"], runs + col["runs"]
+            extra_pictures = col["pictures"]
+        else:
+            extra_pictures = []
+
+        has_body = bool(bullets or table or code or image_refs or columns or extra_pictures)
         if not has_body:
             role = "title" if i == 0 else "section"
-        elif not (bullets or table or code):
+        elif not (bullets or table or code or columns):
             role = "title_only"  # images only: they get the whole content area
         else:
             role = "content"
 
-        layout = _find_layout_by_name(prs, s.get("layout", "")) or _pick_layout(prs, role)
+        layout = _find_layout_by_name(prs, s.get("layout", "")) or (
+            _columns_layout(prs, len(columns)) if columns else _pick_layout(prs, role)
+        )
         ps = prs.slides.add_slide(layout)
         _set_title(ps, s["title"], title_pt)
 
@@ -1296,17 +1526,15 @@ def build_pptx(
                 target.text_frame.text = s["subtitle"]
         else:
             body, area = _content_area(prs, ps)
+            if columns:
+                area = _body_union(prs, ps)
             if s["subtitle"]:
                 if subtitle_ph is not None:
                     subtitle_ph.text_frame.text = s["subtitle"]
                 else:
                     area = _add_lead(ps, s["subtitle"], area)
-            pictures = []
-            for ref in image_refs:
-                loaded = _load_image(ref.get("image"), images, allow_local_images)
-                if loaded:
-                    pictures.append((loaded[0], loaded[1], ref.get("alt", "")))
-            _place_content(prs, ps, body, area, bullets, table, code, pictures)
+            pictures = pictures_of(image_refs) + extra_pictures
+            _place_content(prs, ps, body, area, bullets, table, code, pictures, runs, columns)
 
         if s["notes"]:
             ps.notes_slide.notes_text_frame.text = s["notes"]
@@ -1506,12 +1734,10 @@ return 'failed';
 
 
 def _image_refs(slides) -> set:
-    return {
-        ref.get("image", "")
-        for s in slides
-        for _, ref in s.get("bullets", [])
-        if isinstance(ref, dict)
-    }
+    """Every <img src> in the deck, columns included."""
+    lists = [s.get("bullets", []) for s in slides]
+    lists += [c.get("bullets", []) for s in slides for c in s.get("columns") or []]
+    return {ref.get("image", "") for bullets in lists for _, ref in bullets if isinstance(ref, dict)}
 
 
 class Action:
