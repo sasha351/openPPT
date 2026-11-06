@@ -14,6 +14,7 @@ import io
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
 import urllib.parse
@@ -1036,13 +1037,230 @@ def _place_content(prs, slide, body, area, bullets, table, code, pictures) -> No
         _add_pictures(slide, pictures, pic_area)
 
 
-def build_pptx(slides: list, template=None, *, images=None, allow_local_images=False) -> bytes:
+DEFAULT_ACCENT = "1F4E79"
+WIDE_SLIDE_WIDTH = 12192000  # 13.333in: 16:9 at PowerPoint's 7.5in height
+
+
+def _hex_color(value, default=DEFAULT_ACCENT) -> str:
+    value = (value or "").strip().lstrip("#")
+    return value.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", value) else default
+
+
+def _mix(hex6: str, toward: str, amount: float) -> str:
+    """Blend a color `amount` (0..1) of the way toward another — shades and
+    tints derived from the one accent color the admin picks."""
+    a = [int(hex6[i:i + 2], 16) for i in (0, 2, 4)]
+    b = [int(toward[i:i + 2], 16) for i in (0, 2, 4)]
+    return "".join(f"{round(x + (y - x) * amount):02X}" for x, y in zip(a, b))
+
+
+def _insert_before(parent, child, *later_tags) -> None:
+    """Insert `child` before the first existing child named in `later_tags`
+    (OOXML children are order-sensitive), else append it."""
+    later = {qn(t) for t in later_tags}
+    for i, existing in enumerate(parent):
+        if existing.tag in later:
+            parent.insert(i, child)
+            return
+    parent.append(child)
+
+
+def _solid_fill(defRPr, color: str, scheme: bool = False) -> None:
+    """Replace a run-properties element's fill with one solid color."""
+    for tag in ("a:noFill", "a:solidFill", "a:gradFill", "a:blipFill", "a:pattFill", "a:grpFill"):
+        for old in defRPr.findall(qn(tag)):
+            defRPr.remove(old)
+    fill = defRPr.makeelement(qn("a:solidFill"), {})
+    clr = fill.makeelement(qn("a:schemeClr" if scheme else "a:srgbClr"), {"val": color})
+    fill.append(clr)
+    # a:ln is the only child that may precede the fill
+    ln = defRPr.find(qn("a:ln"))
+    defRPr.insert(list(defRPr).index(ln) + 1 if ln is not None else 0, fill)
+
+
+def _level1(parent, tag="a:lvl1pPr"):
+    """Get-or-create parent/lvl1pPr and its defRPr."""
+    lvl = parent.find(qn(tag))
+    if lvl is None:
+        lvl = parent.makeelement(qn(tag), {})
+        _insert_before(parent, lvl, "a:lvl2pPr", "a:lvl3pPr", "a:extLst")
+    rpr = lvl.find(qn("a:defRPr"))
+    if rpr is None:
+        rpr = lvl.makeelement(qn("a:defRPr"), {})
+        _insert_before(lvl, rpr, "a:extLst")
+    return lvl, rpr
+
+
+def _widen(prs) -> None:
+    """Make python-pptx's 4:3 default template 16:9. Changing the slide size
+    alone leaves every master/layout placeholder where it was, bunched on the
+    left, so their x positions and widths are scaled along with it."""
+    old = int(prs.slide_width)
+    if old >= WIDE_SLIDE_WIDTH * 0.95:
+        return
+    fx = WIDE_SLIDE_WIDTH / old
+    prs.slide_width = Emu(WIDE_SLIDE_WIDTH)
+    for el in [prs.slide_master.element] + [lay.element for lay in prs.slide_layouts]:
+        for off in el.xpath(".//p:cSld//a:off"):
+            off.set("x", str(int(int(off.get("x", "0")) * fx)))
+        for ext in el.xpath(".//p:cSld//a:ext[@cx]"):
+            ext.set("cx", str(int(int(ext.get("cx")) * fx)))
+
+
+def _theme_colors(prs, accent: str) -> None:
+    """Point the theme's accent1/dk2 at the accent. Tables, charts and
+    anything else PowerPoint styles 'Accent 1' pick it up from here."""
+    from lxml import etree
+
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    part = prs.slide_master.part.part_related_by(RT.THEME)
+    root = etree.fromstring(part.blob)
+    scheme = root.find(".//" + qn("a:clrScheme"))
+    for name, color in (("accent1", accent), ("dk2", _mix(accent, "000000", 0.35))):
+        slot = scheme.find(qn("a:" + name))
+        for child in list(slot):
+            slot.remove(child)
+        slot.append(slot.makeelement(qn("a:srgbClr"), {"val": color}))
+    part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
+def _accent_bar(spTree, width: int, height: int, color: str, shape_id: int) -> None:
+    """A full-width accent strip across the top of every content slide, put
+    behind the placeholders on the master."""
+    nsdecl = (
+        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+    )
+    from pptx.oxml import parse_xml
+
+    sp = parse_xml(
+        f'<p:sp {nsdecl}><p:nvSpPr><p:cNvPr id="{shape_id}" name="openPPT accent bar"/>'
+        "<p:cNvSpPr/><p:nvPr userDrawn=\"1\"/></p:nvSpPr><p:spPr>"
+        f'<a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+        f'<a:solidFill><a:srgbClr val="{color}"/></a:solidFill><a:ln><a:noFill/></a:ln>'
+        "</p:spPr></p:sp>"
+    )
+    spTree.insert(2, sp)  # after nvGrpSpPr/grpSpPr: drawn first, i.e. behind
+
+
+def _style_cover_layout(layout, accent: str) -> None:
+    """Title-slide / section-header look: accent background, white
+    left-aligned title, a light tint of the accent for the subtitle."""
+    layout.background.fill.solid()
+    layout.background.fill.fore_color.rgb = RGBColor.from_string(accent)
+    layout.element.set("showMasterSp", "0")  # no accent bar on an accent page
+    # Line every text block up on the title's left edge (python-pptx's
+    # default indents the subtitle), so the left-aligned page reads as one.
+    title = next((ph for ph in layout.placeholders if _ph_type(ph) in TITLE_TYPES), None)
+    for ph in layout.placeholders:
+        if title is None or ph is title or _ph_type(ph) in CHROME_TYPES + TITLE_TYPES:
+            continue
+        if ph.width is not None and title.width is not None:
+            ph.left, ph.width = title.left, title.width
+    for ph in layout.placeholders:
+        t = _ph_type(ph)
+        if t in CHROME_TYPES:
+            continue
+        txBody = ph.element.find(qn("p:txBody"))
+        if txBody is None:
+            continue
+        lst = txBody.find(qn("a:lstStyle"))
+        if lst is None:
+            lst = txBody.makeelement(qn("a:lstStyle"), {})
+            _insert_before(txBody, lst, "a:p")
+        lvl, rpr = _level1(lst)
+        lvl.set("algn", "l")
+        color = "FFFFFF" if t in TITLE_TYPES else _mix(accent, "FFFFFF", 0.8)
+        _solid_fill(rpr, color)
+
+
+def _apply_builtin_theme(prs, accent=None) -> None:
+    """The look used when no template is in play — python-pptx's default is
+    a plain 4:3 white deck. 16:9, an accent color (theme accent1, which also
+    styles tables), left-aligned dark titles, accent bullets, an accent strip
+    on content slides, and accent title/section pages. Best effort: a failure
+    leaves the plain default, never a failed export."""
+    accent = _hex_color(accent)
+    try:
+        _widen(prs)
+        _theme_colors(prs, accent)
+        master = prs.slide_master.element
+        title_lvl, title_rpr = _level1(master.find(qn("p:txStyles")).find(qn("p:titleStyle")))
+        title_lvl.set("algn", "l")
+        _solid_fill(title_rpr, "tx2", scheme=True)
+        title_rpr.set("b", "1")
+        body_style = master.find(qn("p:txStyles")).find(qn("p:bodyStyle"))
+        for lvl in body_style:
+            if lvl.tag.endswith("pPr") and lvl.find(qn("a:buClr")) is None:
+                clr = lvl.makeelement(qn("a:buClr"), {})
+                clr.append(clr.makeelement(qn("a:schemeClr"), {"val": "accent1"}))
+                _insert_before(
+                    lvl, clr, "a:buSzTx", "a:buSzPct", "a:buSzPts", "a:buFontTx",
+                    "a:buFont", "a:buNone", "a:buAutoNum", "a:buChar", "a:buBlip",
+                    "a:tabLst", "a:defRPr", "a:extLst",
+                )
+        ids = [int(i) for i in master.xpath(".//p:cNvPr/@id")] or [0]
+        _accent_bar(
+            master.find(qn("p:cSld")).find(qn("p:spTree")),
+            int(prs.slide_width), int(Pt(6)), accent, max(ids) + 1,
+        )
+        for layout in prs.slide_layouts:
+            stats = _layout_stats(layout)
+            if (stats["title"] and stats["subtitle"] and not stats["body"]) or (
+                "section" in layout.name.lower()
+            ):
+                _style_cover_layout(layout, accent)
+    except Exception as e:
+        print(f"[openPPT] built-in theme skipped: {type(e).__name__}: {e}", flush=True)
+
+
+def _add_slide_number(slide, number: int) -> None:
+    """Fill the layout's slide-number placeholder, where the template put it.
+
+    python-pptx's add_slide never copies the date/footer/slide-number
+    placeholders, so without this no deck ever had page numbers. The field
+    renumbers itself in PowerPoint; the literal is for viewers that don't.
+    """
+    for layout_ph in slide.slide_layout.placeholders:
+        if _ph_type(layout_ph) != PP_PLACEHOLDER.SLIDE_NUMBER:
+            continue
+        idx = layout_ph.placeholder_format.idx
+        slide.shapes.clone_placeholder(layout_ph)
+        for ph in slide.placeholders:
+            if ph.placeholder_format.idx == idx:
+                p = ph.text_frame.paragraphs[0]._p
+                fld = p.makeelement(
+                    qn("a:fld"),
+                    {"id": "{B6F15528-21DE-4FAA-801E-634DDDAF4B2B}", "type": "slidenum"},
+                )
+                text = fld.makeelement(qn("a:t"), {})
+                text.text = str(number)
+                fld.append(text)
+                _insert_before(p, fld, "a:endParaRPr")
+        return
+
+
+def build_pptx(
+    slides: list,
+    template=None,
+    *,
+    images=None,
+    allow_local_images=False,
+    accent=None,
+    slide_numbers=True,
+) -> bytes:
     """Build a .pptx from parsed slides.
 
     template: optional .pptx/.potx as bytes, a stream, a path, or a
     Presentation. When given, the deck inherits that template's theme,
     fonts, and layouts, and each slide's 'layout' name is matched against the
-    template's layouts. When omitted, the python-pptx default template is used.
+    template's layouts. When omitted, openPPT's built-in 16:9 theme is used,
+    colored by `accent` (a hex color; DEFAULT_ACCENT if unset or invalid).
+
+    slide_numbers: number every slide after the first, in the layout's own
+    slide-number position (template or built-in).
 
     images: optional {src: bytes} of image sources the caller already
     resolved (the Action resolves Open WebUI file links this way).
@@ -1051,6 +1269,8 @@ def build_pptx(slides: list, template=None, *, images=None, allow_local_images=F
     """
     prs = _as_presentation(template)
     _clear_slides(prs)
+    if template is None:
+        _apply_builtin_theme(prs, accent)
     title_pt = _template_title_size(prs)
 
     for i, s in enumerate(slides):
@@ -1091,6 +1311,9 @@ def build_pptx(slides: list, template=None, *, images=None, allow_local_images=F
         if s["notes"]:
             ps.notes_slide.notes_text_frame.text = s["notes"]
         _drop_empty_placeholders(ps)
+        if slide_numbers and role not in ("title", "section"):
+            # not on cover pages: a page number is noise on a title or divider
+            _add_slide_number(ps, i + 1)
 
     buf = io.BytesIO()
     prs.save(buf)
@@ -1282,8 +1505,29 @@ return 'failed';
 """
 
 
+def _image_refs(slides) -> set:
+    return {
+        ref.get("image", "")
+        for s in slides
+        for _, ref in s.get("bullets", [])
+        if isinstance(ref, dict)
+    }
+
+
 class Action:
     class Valves(BaseModel):
+        default_template: str = Field(
+            default="",
+            description="Template for decks when no .pptx/.potx is attached to the chat: an absolute path on the Open WebUI server, or the id of a file uploaded to Open WebUI. Empty = openPPT's built-in 16:9 theme. A template attached to the chat always wins.",
+        )
+        accent_color: str = Field(
+            default=DEFAULT_ACCENT,
+            description="Hex color (e.g. 1F4E79) for the built-in theme: title pages, titles, bullets, tables. Ignored when a template is used.",
+        )
+        slide_numbers: bool = Field(
+            default=True,
+            description="Number every slide except title and section pages.",
+        )
         auto_download: bool = Field(
             default=True,
             description="Download the .pptx in the browser as soon as it's built, in addition to the attachment chip and link under the message.",
@@ -1440,17 +1684,28 @@ class Action:
                     f"```\n{seen}\n```\n"
                 )
 
+            # Precedence: a template attached to the chat, then the admin's
+            # default_template Valve, then the built-in theme.
             template = await self._find_template(body, __user__)
+            note = " on your template" if template is not None else ""
+            if template is None:
+                template = await self._default_template()
+                note = " on the default template" if template is not None else ""
             wants_layout = any(s.get("layout") for s in slides)
             if wants_layout and template is None:
                 await status(
                     "This deck names layouts but no .pptx/.potx template is "
-                    "attached — using the default theme.",
+                    "attached — using the built-in theme.",
                 )
 
-            note = " on your template" if template is not None else ""
             await status(f"Building PowerPoint ({len(slides)} slides{note})…")
-            data = build_pptx(slides, template=template)
+            data = build_pptx(
+                slides,
+                template=template,
+                images=await self._owui_images(slides, __user__),
+                accent=self.valves.accent_color,
+                slide_numbers=self.valves.slide_numbers,
+            )
 
             # ponytail: internal Files/Storage API — swap to REST POST /api/v1/files/
             # with the user's token if these internals change across Open WebUI versions.
@@ -1573,6 +1828,59 @@ class Action:
         except Exception as e:
             print(f"[openPPT] chat lookup failed: {type(e).__name__}: {e}", flush=True)
             return None
+
+    async def _default_template(self):
+        """Bytes of the admin's default_template Valve (a server path or an
+        Open WebUI file id), or None. A bad setting is logged, not fatal."""
+        ref = (self.valves.default_template or "").strip()
+        if not ref:
+            return None
+        try:
+            if os.path.isfile(ref):
+                with open(ref, "rb") as fh:
+                    return fh.read()
+            from open_webui.models.files import Files
+            from open_webui.storage.provider import Storage
+
+            rec = await _maybe_await(Files.get_file_by_id(ref))
+            if rec is not None:
+                with open(Storage.get_file(rec.path), "rb") as fh:
+                    return fh.read()
+        except Exception as e:
+            print(f"[openPPT] default_template unusable: {type(e).__name__}: {e}", flush=True)
+        else:
+            print(f"[openPPT] default_template not found: {ref}", flush=True)
+        return None
+
+    async def _owui_images(self, slides, user) -> dict:
+        """{src: bytes} for <img> sources that are Open WebUI file links —
+        how its own generated and uploaded images are referenced. Read
+        straight from storage (fetching them over HTTP would need the user's
+        token, and the server's own address is private). Scoped to the
+        requesting user's files; admins can reach any file, as in the UI."""
+        found = {}
+        user = user or {}
+        for src in _image_refs(slides):
+            match = OWUI_FILE_RE.search(src or "")
+            if not match:
+                continue
+            try:
+                from open_webui.models.files import Files
+                from open_webui.storage.provider import Storage
+
+                fid, rec = match.group(1), None
+                scoped = getattr(Files, "get_file_by_id_and_user_id", None)
+                if scoped is not None and user.get("id"):
+                    rec = await _maybe_await(scoped(fid, user["id"]))
+                if rec is None and user.get("role") == "admin":
+                    rec = await _maybe_await(Files.get_file_by_id(fid))
+                if rec is None:
+                    continue
+                with open(Storage.get_file(rec.path), "rb") as fh:
+                    found[src] = fh.read(MAX_IMAGE_BYTES + 1)
+            except Exception as e:
+                print(f"[openPPT] image {src} skipped: {type(e).__name__}: {e}", flush=True)
+        return found
 
     async def _find_template(self, body: dict, __user__: dict):
         """Return template bytes from the most recent .pptx/.potx attached to

@@ -8,6 +8,7 @@ into a text file, then run this against it.
 Usage:
     python outline_to_pptx.py outline.html
     python outline_to_pptx.py outline.html -o deck.pptx -t brand.pptx
+    python outline_to_pptx.py outline.html --accent 0F766E
     pbpaste | python outline_to_pptx.py -    # read the outline from stdin
 
 See README.md's "Outline format" section for the HTML grammar.
@@ -23,6 +24,8 @@ def main():
     ap.add_argument("outline", help="path to an HTML outline file, or - to read stdin")
     ap.add_argument("-o", "--output", help="output .pptx path (default: <outline>.pptx)")
     ap.add_argument("-t", "--template", help=".pptx/.potx to inherit theme, fonts, and layouts from")
+    ap.add_argument("--accent", help="hex accent color for the built-in theme (default 1F4E79)")
+    ap.add_argument("--no-slide-numbers", action="store_true", help="leave slides unnumbered")
     args = ap.parse_args()
 
     if args.outline == "-":
@@ -41,7 +44,17 @@ def main():
         )
 
     with open(out, "wb") as f:
-        f.write(build_pptx(slides, template=args.template))
+        f.write(
+            build_pptx(
+                slides,
+                template=args.template,
+                accent=args.accent,
+                slide_numbers=not args.no_slide_numbers,
+                # Your own machine, your own files: unlike in Open WebUI,
+                # <img src="./chart.png"> may name a local path here.
+                allow_local_images=True,
+            )
+        )
     print(f"wrote {out} ({len(slides)} slides)")
 
 

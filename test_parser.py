@@ -269,7 +269,7 @@ def test_long_title_shrinks_instead_of_overlapping_the_body():
     )
     frame = out.slides[0].shapes.title.text_frame
     assert frame.word_wrap is True
-    assert frame.paragraphs[0].font.size.pt <= 20
+    assert frame.paragraphs[0].font.size.pt <= 24  # the template's is 44
 
 
 def test_short_title_keeps_the_templates_own_size():
@@ -324,6 +324,68 @@ def test_bullets_keep_their_width_next_to_a_code_block():
     (code,) = [s for s in slide.shapes if s.has_text_frame and "make ship" in s.text_frame.text]
     assert code.top >= body.top + body.height
     _shapes_inside_slide(out, slide)
+
+
+def _layout_shapes_inside(prs):
+    for owner in [prs.slide_master] + list(prs.slide_layouts):
+        for shape in owner.shapes:
+            if shape.width is None:
+                continue
+            assert shape.left + shape.width <= prs.slide_width + 1, (owner.name, shape.name)
+
+
+def test_default_deck_is_16_9_with_layouts_rescaled():
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE))))
+    assert abs(prs.slide_width / prs.slide_height - 16 / 9) < 0.01
+    _layout_shapes_inside(prs)
+    # placeholders were widened with the slide, not left bunched on the left
+    title = prs.slides[1].shapes.title
+    assert title.width > prs.slide_width * 0.8
+    for slide in prs.slides:
+        _shapes_inside_slide(prs, slide)
+
+
+def test_accent_color_reaches_the_theme():
+    from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE), accent="#0F766E")))
+    theme = prs.slide_master.part.part_related_by(RT.THEME).blob.decode()
+    assert '<a:accent1><a:srgbClr val="0F766E"/></a:accent1>' in theme
+    # the title page uses it as its background
+    cover = prs.slides[0].slide_layout
+    assert str(cover.background.fill.fore_color.rgb) == "0F766E"
+    # an invalid color falls back instead of failing the export
+    bad = Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE), accent="not-a-color")))
+    assert bad.slides
+
+
+def test_template_decks_keep_their_own_look():
+    template = _make_template_bytes()
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE), template=template)))
+    assert prs.slide_width == Presentation(io.BytesIO(template)).slide_width  # 4:3 kept
+    assert "openPPT accent bar" not in [s.name for s in prs.slide_master.shapes]
+
+
+def test_slide_numbers_on_every_slide_but_the_first():
+    from pptx.enum.shapes import PP_PLACEHOLDER
+
+    def numbers(prs):
+        return [
+            [ph.text_frame.text for ph in slide.placeholders
+             if ph.placeholder_format.type == PP_PLACEHOLDER.SLIDE_NUMBER]
+            for slide in prs.slides
+        ]
+
+    prs = Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE))))
+    assert numbers(prs) == [[], ["2"], ["3"], ["4"]]
+    # and not on a section divider either
+    divided = Presentation(io.BytesIO(build_pptx(parse_outline(
+        '<slide title="Deck"></slide><slide title="Part 2"></slide><slide title="X"><li>a</li></slide>'
+    ))))
+    assert numbers(divided) == [[], [], ["3"]]
+    assert prs.slides[1].placeholders[12]._element.xpath(".//a:fld[@type='slidenum']")
+    off = Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE), slide_numbers=False)))
+    assert numbers(off) == [[], [], [], []]
 
 
 def _png(w, h):
@@ -577,7 +639,8 @@ class _FakeRequest:
 
 
 def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
-                body_content=None, history=False, event_call=None, valves=None):
+                body_content=None, history=False, event_call=None, valves=None,
+                attach=True, user=None, extra_files=None):
     """Drive Action.action against stand-in Open WebUI Files/Storage modules.
 
     Open WebUI's Files API is sync in older versions and async in current ones,
@@ -601,10 +664,14 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
         template_path = fh.name
 
     inserted = {}
+    uploaded = _run_action.uploaded = []
+    owners = {"f1": "u1", **{fid: owner for fid, (owner, _) in (extra_files or {}).items()}}
 
     class Record:
-        filename = "brand.pptx"
-        path = template_path
+        def __init__(self, fid):
+            self.filename, self.path = "brand.pptx", template_path
+            if fid in (extra_files or {}):
+                self.filename, self.path = "image.png", extra_files[fid][1]
 
     class Files:
         @staticmethod
@@ -621,14 +688,25 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
         @staticmethod
         def get_file_by_id(fid):
             async def _get():
-                return Record()
+                return Record(fid)
 
-            return _get() if async_api else Record()
+            return _get() if async_api else Record(fid)
+
+        @staticmethod
+        def get_file_by_id_and_user_id(fid, user_id):
+            rec = Record(fid) if owners.get(fid) == user_id else None
+
+            async def _get():
+                return rec
+
+            return _get() if async_api else rec
 
     class Storage:
         @staticmethod
         def upload_file(stream, filename, tags=None):
-            return stream.read(), f"/data/{filename}"
+            data = stream.read()
+            uploaded.append(data)
+            return data, f"/data/{filename}"
 
         @staticmethod
         def get_file(path):
@@ -636,7 +714,7 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
 
     stored_messages = [
         {"id": "m0", "role": "user", "content": "deck please",
-         "files": [{"type": "file", "id": "f1", "name": "brand.pptx"}]},
+         "files": [{"type": "file", "id": "f1", "name": "brand.pptx"}] if attach else []},
         {"id": "m1", "role": "assistant", "content": content},
     ]
 
@@ -698,7 +776,7 @@ def _run_action(async_api: bool, content: str = SAMPLE, __request__=None,
         result = asyncio.run(
             action.action(
                 body,
-                __user__={"id": "u1"},
+                __user__=user or {"id": "u1", "role": "user"},
                 __event_emitter__=emitter,
                 __event_call__=event_call,
                 __request__=__request__,
@@ -841,6 +919,63 @@ def test_action_appends_full_url_when_request_available():
     assert APPENDIX_MARKER in download_msg
     # the full URL is repeated as its own line, after everything else
     assert download_msg.rstrip().endswith(full_link)
+
+
+def _statuses(events):
+    return " ".join(str(e["data"].get("description", "")) for e in events if e["type"] == "status")
+
+
+def test_template_precedence_attached_then_valve_then_builtin():
+    import tempfile
+
+    wide = Presentation()
+    wide.slide_width = 12192000
+    buf = io.BytesIO()
+    wide.save(buf)
+    with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as fh:
+        fh.write(buf.getvalue())
+    valve = {"default_template": fh.name}
+
+    def deck():
+        return Presentation(io.BytesIO(_run_action.uploaded[-1]))
+
+    # attached template wins over the Valve (the attachment is 4:3)
+    events, _ = _run_action(False, valves=valve)
+    assert "on your template" in _statuses(events)
+    assert deck().slide_width == 9144000
+    # no attachment: the admin's default template
+    events, _ = _run_action(False, valves=valve, attach=False)
+    assert "on the default template" in _statuses(events)
+    assert deck().slide_width == 12192000
+    assert "openPPT accent bar" not in [s.name for s in deck().slide_master.shapes]
+    # neither: the built-in theme, in the Valve's accent color
+    events, _ = _run_action(False, attach=False, valves={"accent_color": "0F766E"})
+    assert "template" not in _statuses(events)
+    assert "openPPT accent bar" in [s.name for s in deck().slide_master.shapes]
+    # a broken Valve setting falls back rather than failing the export
+    events, inserted = _run_action(False, attach=False, valves={"default_template": "/nope.pptx"})
+    assert inserted and "failed" not in _statuses(events)
+
+
+def test_open_webui_image_links_are_read_from_storage_for_their_owner_only():
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+        fh.write(_png(60, 30))
+    outline = (
+        '<slide title="Pics"><img src="/api/v1/files/mine/content" alt="mine">'
+        '<img src="http://host.example/api/v1/files/theirs/content" alt="theirs"></slide>'
+    )
+    files = {"mine": ("u1", fh.name), "theirs": ("u2", fh.name)}
+
+    def pictures():
+        prs = Presentation(io.BytesIO(_run_action.uploaded[-1]))
+        return [s for s in prs.slides[0].shapes if s.shape_type == 13]
+
+    _run_action(True, content=outline, extra_files=files)
+    assert len(pictures()) == 1  # someone else's file isn't readable
+    _run_action(True, content=outline, extra_files=files, user={"id": "u1", "role": "admin"})
+    assert len(pictures()) == 2  # an admin can reach any file, as in the UI
 
 
 def test_history_wins_when_the_flat_message_list_lags_behind():
