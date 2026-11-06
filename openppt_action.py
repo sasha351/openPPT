@@ -1,9 +1,9 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.8.0
+version: 0.8.1
 requirements: python-pptx
-description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a .pptx that downloads straight away — with columns, tables, code blocks, speaker notes, images, bold/italic text, and slide numbers. Attach a .pptx/.potx to the chat (or set a default template in the Valves) and the deck inherits its theme, fonts, and layouts; otherwise it uses a built-in 16:9 theme in your accent color. Works with any model (no tool calling needed).
+description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a .pptx that downloads straight away — with columns, tables, code blocks, speaker notes, images, bold/italic text, and slide numbers. Set a default template in the Valves (by the filename of a template an admin uploaded to Open WebUI) and every user's deck is built on it, or attach a .pptx/.potx to a chat to use that one instead; otherwise it uses a built-in 16:9 theme in your accent color. Works with any model (no tool calling needed).
 """
 
 import asyncio
@@ -20,6 +20,7 @@ import socket
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from html.parser import HTMLParser
 
 try:
@@ -52,7 +53,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 # How long the browser gets to start the auto-download before the export
 # carries on without it (the chip and the link still deliver the file).
@@ -656,15 +657,50 @@ def list_layouts(prs_or_bytes) -> list:
     return [(lay.name, _layout_stats(lay)) for lay in prs.slide_layouts]
 
 
+_TEMPLATE_MAIN_CT = b"application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"
+_PRESENTATION_MAIN_CT = b"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+
+
+def _as_pptx_bytes(data: bytes) -> bytes:
+    """A .potx as .pptx bytes; anything else unchanged.
+
+    python-pptx refuses to open a real .potx ("not a PowerPoint file") — it
+    only checks the main part's content type, which is the one thing that
+    differs from a .pptx. Rewriting that type in [Content_Types].xml is the
+    whole conversion, and the deck built from it saves as a proper .pptx.
+    """
+    try:
+        src = zipfile.ZipFile(io.BytesIO(data))
+        types = src.read("[Content_Types].xml")
+        if _TEMPLATE_MAIN_CT not in types:
+            return data
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                body = src.read(item.filename)
+                if item.filename == "[Content_Types].xml":
+                    body = body.replace(_TEMPLATE_MAIN_CT, _PRESENTATION_MAIN_CT)
+                dst.writestr(item, body)
+        return out.getvalue()
+    except Exception:
+        return data
+
+
 def _as_presentation(template):
-    """Coerce None / bytes / stream / Presentation into a Presentation."""
+    """Coerce None / bytes / stream / path / Presentation into a Presentation
+    (a .potx included)."""
     if template is None:
         return Presentation()
     if hasattr(template, "slide_layouts"):
         return template
     if isinstance(template, (bytes, bytearray)):
-        return Presentation(io.BytesIO(template))
-    return Presentation(template)  # file path or file-like
+        data = bytes(template)
+    elif hasattr(template, "read"):
+        data = template.read()
+    else:
+        with open(template, "rb") as fh:
+            data = fh.read()
+    return Presentation(io.BytesIO(_as_pptx_bytes(data)))
 
 
 def _find_layout_by_name(prs, name: str):
@@ -1778,6 +1814,72 @@ return 'failed';
 """
 
 
+TEMPLATE_EXTENSIONS = (".pptx", ".potx")
+
+
+async def _read_owui_file(rec):
+    """Bytes of an Open WebUI file record, from whichever storage backs it."""
+    from open_webui.storage.provider import Storage
+
+    with open(Storage.get_file(rec.path), "rb") as fh:
+        return fh.read()
+
+
+async def _is_admin(user_id) -> bool:
+    try:
+        from open_webui.models.users import Users
+
+        user = await _maybe_await(Users.get_user_by_id(user_id))
+        return getattr(user, "role", None) == "admin"
+    except Exception:
+        return False  # can't tell: don't trust it
+
+
+async def _resolve_template_ref(ref: str):
+    """Bytes of the template a `default_template` setting names, or None.
+
+    Accepts, in order: an absolute path on the server; an Open WebUI file id;
+    or a filename such as 'brand.potx' — the newest file of that name that an
+    admin uploaded (attached to any chat, or added to a Knowledge base), so the
+    template can be managed from Open WebUI's own UI and replaced by uploading
+    a new version. Admin-only, so a user uploading a file with the same name
+    can't swap everyone's template. Duplicated in the filter on purpose:
+    Functions can't import one another.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    try:
+        if os.path.isabs(ref) and os.path.isfile(ref):
+            with open(ref, "rb") as fh:
+                return fh.read()
+        from open_webui.models.files import Files
+
+        rec = await _maybe_await(Files.get_file_by_id(ref))
+        if rec is not None:
+            return await _read_owui_file(rec)
+        if not ref.lower().endswith(TEMPLATE_EXTENSIONS):
+            return None
+        search = getattr(Files, "search_files", None)
+        if search is not None:  # v0.12+: newest first
+            found = await _maybe_await(search(filename=ref, limit=50))
+        else:
+            found = sorted(
+                (f for f in await _maybe_await(Files.get_files())
+                 if (f.filename or "").lower() == ref.lower()),
+                key=lambda f: f.created_at or 0,
+                reverse=True,
+            )
+        for rec in found:
+            if (rec.filename or "").lower() == ref.lower() and await _is_admin(rec.user_id):
+                return await _read_owui_file(rec)
+    except Exception as e:
+        print(f"[openPPT] default_template {ref!r} unusable: {type(e).__name__}: {e}", flush=True)
+        return None
+    print(f"[openPPT] default_template {ref!r}: no such path, file id, or admin-uploaded file", flush=True)
+    return None
+
+
 def _image_refs(slides) -> set:
     """Every <img src> in the deck, columns included."""
     lists = [s.get("bullets", []) for s in slides]
@@ -1789,7 +1891,7 @@ class Action:
     class Valves(BaseModel):
         default_template: str = Field(
             default="",
-            description="Template for decks when no .pptx/.potx is attached to the chat: an absolute path on the Open WebUI server, or the id of a file uploaded to Open WebUI. Empty = openPPT's built-in 16:9 theme. A template attached to the chat always wins.",
+            description="Template every deck uses when no .pptx/.potx is attached to the chat. Easiest: upload the template to Open WebUI as an admin (attach it to any chat, or add it to a Knowledge base) and enter its filename here, e.g. brand.potx — the newest admin upload with that name is used, so uploading a new version replaces it. Also accepts an absolute server path or an Open WebUI file id. The Template Primer filter reads this too, so the model is told the template's layout names. Empty = openPPT's built-in 16:9 theme. A template attached to the chat always wins.",
         )
         accent_color: str = Field(
             default=DEFAULT_ACCENT,
@@ -2109,27 +2211,10 @@ class Action:
             return None
 
     async def _default_template(self):
-        """Bytes of the admin's default_template Valve (a server path or an
-        Open WebUI file id), or None. A bad setting is logged, not fatal."""
-        ref = (self.valves.default_template or "").strip()
-        if not ref:
-            return None
-        try:
-            if os.path.isfile(ref):
-                with open(ref, "rb") as fh:
-                    return fh.read()
-            from open_webui.models.files import Files
-            from open_webui.storage.provider import Storage
-
-            rec = await _maybe_await(Files.get_file_by_id(ref))
-            if rec is not None:
-                with open(Storage.get_file(rec.path), "rb") as fh:
-                    return fh.read()
-        except Exception as e:
-            print(f"[openPPT] default_template unusable: {type(e).__name__}: {e}", flush=True)
-        else:
-            print(f"[openPPT] default_template not found: {ref}", flush=True)
-        return None
+        """Bytes of the admin's default_template Valve, or None. A bad
+        setting is logged, not fatal — the deck falls back to the built-in
+        theme."""
+        return await _resolve_template_ref(self.valves.default_template)
 
     async def _owui_images(self, slides, user) -> dict:
         """{src: bytes} for <img> sources that are Open WebUI file links —

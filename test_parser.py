@@ -1264,6 +1264,138 @@ def test_a_cut_off_reply_is_flagged():
     assert any("cut off" in w and "'B'" in w for w in warnings), warnings
 
 
+
+
+def _potx_bytes():
+    """A real .potx: a .pptx whose main part says 'template'."""
+    import zipfile
+
+    buf = io.BytesIO()
+    Presentation().save(buf)
+    src = zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"presentationml.presentation.main+xml", b"presentationml.template.main+xml"
+                )
+            z.writestr(item, data)
+    return out.getvalue()
+
+
+def _fake_owui_library(files, users, actions=()):
+    """Stand-in open_webui with async Files/Users/Functions as in v0.12.
+    files: [(id, filename, owner_id, path)] newest first; users: {id: role};
+    actions: [(id, source, valves)]. Returns an undo function."""
+    import sys
+    import types
+
+    class Rec:
+        def __init__(self, fid, name, owner, path):
+            self.id, self.filename, self.user_id, self.path = fid, name, owner, path
+            self.created_at = 0
+
+    recs = [Rec(*f) for f in files]
+
+    async def _v(value):
+        return value
+
+    class Files:
+        @staticmethod
+        def get_file_by_id(fid):
+            return _v(next((r for r in recs if r.id == fid), None))
+
+        @staticmethod
+        def search_files(user_id=None, filename="*", skip=0, limit=100):
+            return _v([r for r in recs if r.filename.lower() == filename.lower()][:limit])
+
+    class Storage:
+        @staticmethod
+        def get_file(path):
+            return path
+
+    class Users:
+        @staticmethod
+        def get_user_by_id(uid):
+            return _v(types.SimpleNamespace(id=uid, role=users[uid]) if uid in users else None)
+
+    class Functions:
+        @staticmethod
+        def get_functions_by_type(kind, active_only=False):
+            return _v([types.SimpleNamespace(id=i, content=c) for i, c, _ in actions] if kind == "action" else [])
+
+        @staticmethod
+        def get_function_valves_by_id(fid):
+            return _v(next((v for i, _, v in actions if i == fid), None))
+
+    class Chats:
+        @staticmethod
+        def get_chat_by_id(cid):
+            return _v(None)
+
+    mods = {name: types.ModuleType(name) for name in (
+        "open_webui", "open_webui.models", "open_webui.models.files", "open_webui.models.users",
+        "open_webui.models.functions", "open_webui.models.chats",
+        "open_webui.storage", "open_webui.storage.provider",
+    )}
+    mods["open_webui.models.files"].Files = Files
+    mods["open_webui.models.users"].Users = Users
+    mods["open_webui.models.functions"].Functions = Functions
+    mods["open_webui.models.chats"].Chats = Chats
+    mods["open_webui.storage.provider"].Storage = Storage
+    sys.modules.update(mods)
+    return lambda: [sys.modules.pop(k, None) for k in mods]
+
+
+def _write_tmp(data, suffix):
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        fh.write(data)
+    return fh.name
+
+
+def test_a_real_potx_template_works():
+    """python-pptx refuses a .potx outright ('not a PowerPoint file'), so a
+    .potx template — attached or default — failed the export."""
+    from pptx.opc.constants import CONTENT_TYPE as CT
+
+    potx = _potx_bytes()
+    data = build_pptx(parse_outline(SAMPLE), template=potx)
+    out = Presentation(io.BytesIO(data))  # and the result is a normal .pptx
+    assert out.part.content_type == CT.PML_PRESENTATION_MAIN
+    assert len(out.slides) == 4 and out.slide_width == 9144000  # the template's, not built-in
+    path = _write_tmp(potx, ".potx")  # the CLI passes a path
+    assert len(Presentation(io.BytesIO(build_pptx(parse_outline(SAMPLE), template=path))).slides) == 4
+
+
+def test_default_template_by_filename_is_the_newest_admin_upload():
+    import asyncio
+
+    from openppt_action import _resolve_template_ref
+
+    potx, other = _write_tmp(_potx_bytes(), ".potx"), _write_tmp(b"user's file", ".potx")
+    undo = _fake_owui_library(
+        files=[  # newest first
+            ("f-user", "Brand.potx", "u-user", other),  # a user can't hijack the name
+            ("f-new", "brand.potx", "u-admin", potx),
+            ("f-old", "brand.potx", "u-admin", other),
+        ],
+        users={"u-admin": "admin", "u-user": "user"},
+    )
+    try:
+        got = asyncio.run(_resolve_template_ref("brand.potx"))
+        assert got == open(potx, "rb").read()
+        assert asyncio.run(_resolve_template_ref("f-old")) == b"user's file"  # by file id
+        assert asyncio.run(_resolve_template_ref(potx)) == got  # by server path
+        assert asyncio.run(_resolve_template_ref("missing.potx")) is None
+        assert asyncio.run(_resolve_template_ref("")) is None
+    finally:
+        undo()
+
+
 # Kept last: anything defined below this block would be skipped when the file
 # is run standalone (two tests silently were, before v0.8.0).
 if __name__ == "__main__":

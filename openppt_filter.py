@@ -1,14 +1,16 @@
 """
 title: PowerPoint Template Primer
 author: openPPT
-version: 0.5.0
+version: 0.6.0
 requirements: python-pptx
-description: When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT HTML outline format, and tells it to distill the content you provided into a logically flowing deck that fills those layouts. Without a template, it still primes deck/presentation requests — and follow-up edits to a deck already in the chat — with the same outline format and a content-quality bar. Pair it with the "Export to PowerPoint" action: dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
+description: Primes the model with your PowerPoint template's layout names and the openPPT HTML outline format before it answers — for a template attached to the chat, or, for every user's deck requests, the default template set on the "Export to PowerPoint" action. When you attach a .pptx/.potx template to the chat, this primes the model — before it answers — with your template's layout names and the openPPT HTML outline format, and tells it to distill the content you provided into a logically flowing deck that fills those layouts. Without a template, it still primes deck/presentation requests — and follow-up edits to a deck already in the chat — with the same outline format and a content-quality bar. Pair it with the "Export to PowerPoint" action: dump your content, and the model formats a deck you can export in one click. Works with any model (no tool calling needed).
 """
 
 import inspect
 import io
+import os
 import re
+import zipfile
 
 from pptx import Presentation
 from pptx.enum.shapes import PP_PLACEHOLDER
@@ -104,8 +106,33 @@ def _describe_layout(layout) -> str:
     return f"- {layout.name} — {hint}"
 
 
+_TEMPLATE_MAIN_CT = b"application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"
+_PRESENTATION_MAIN_CT = b"application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+
+
+def _as_pptx_bytes(data: bytes) -> bytes:
+    """A .potx as .pptx bytes (python-pptx refuses a real .potx by its main
+    part's content type, the only thing that differs). Duplicated from the
+    export action on purpose."""
+    try:
+        src = zipfile.ZipFile(io.BytesIO(data))
+        types = src.read("[Content_Types].xml")
+        if _TEMPLATE_MAIN_CT not in types:
+            return data
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                body = src.read(item.filename)
+                if item.filename == "[Content_Types].xml":
+                    body = body.replace(_TEMPLATE_MAIN_CT, _PRESENTATION_MAIN_CT)
+                dst.writestr(item, body)
+        return out.getvalue()
+    except Exception:
+        return data
+
+
 def _layouts_from_bytes(data: bytes) -> list:
-    prs = Presentation(io.BytesIO(data))
+    prs = Presentation(io.BytesIO(_as_pptx_bytes(data)))
     return [_describe_layout(lay) for lay in prs.slide_layouts]
 
 
@@ -127,11 +154,16 @@ _FORMAT_RULES = """- Wrap every slide in <slide title="...">...</slide>. The fir
   the outline still goes in full in your final answer."""
 
 
-def _template_primer(layout_lines: list) -> str:
+def _template_primer(layout_lines: list, attached: bool = True) -> str:
     layouts = "\n".join(layout_lines)
+    whose = (
+        "The user attached a PowerPoint template and provided content to turn into a\npresentation."
+        if attached
+        else "Decks here are built on the organisation's PowerPoint template, and the\nuser wants a presentation."
+    )
+    source = "the attached template" if attached else "the template"
     return f"""{SENTINEL}
-The user attached a PowerPoint template and provided content to turn into a
-presentation. Distill the content they gave you into a deck — pull out the
+{whose} Distill the content they gave you into a deck — pull out the
 substance, group it by theme, and cut anything that doesn't earn its place.
 Do not invent facts that aren't in their content; you may condense and
 rephrase.
@@ -158,7 +190,7 @@ Formatting rules:
 {_QUALITY_BAR}
 
 Choose a layout for each slide with the layout="<name>" attribute, using ONLY
-these layouts from the attached template:
+these layouts from {source}:
 {layouts}
 
 If the user's latest message isn't about the deck, ignore this and answer
@@ -196,8 +228,8 @@ If this isn't a deck/presentation request, ignore this and answer normally.
 When the user later asks for changes, reply with the full revised outline."""
 
 
-def _primer(layout_lines: list = None) -> str:
-    return _template_primer(layout_lines) if layout_lines else _no_template_primer()
+def _primer(layout_lines: list = None, attached: bool = True) -> str:
+    return _template_primer(layout_lines, attached) if layout_lines else _no_template_primer()
 
 
 def _looks_like_deck_request(messages: list) -> bool:
@@ -261,6 +293,82 @@ def _chat_messages(chat) -> list:
     return hist if len(hist) > len(flat) else flat
 
 
+TEMPLATE_EXTENSIONS = (".pptx", ".potx")
+
+
+async def _read_owui_file(rec):
+    from open_webui.storage.provider import Storage
+
+    with open(Storage.get_file(rec.path), "rb") as fh:
+        return fh.read()
+
+
+async def _is_admin(user_id) -> bool:
+    try:
+        from open_webui.models.users import Users
+
+        user = await _maybe_await(Users.get_user_by_id(user_id))
+        return getattr(user, "role", None) == "admin"
+    except Exception:
+        return False  # can't tell: don't trust it
+
+
+async def _resolve_template_ref(ref: str):
+    """Bytes of the template a `default_template` setting names: an absolute
+    server path, an Open WebUI file id, or a filename — the newest file of
+    that name an admin uploaded. Duplicated from the export action on
+    purpose; the two must resolve the same setting to the same file."""
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    try:
+        if os.path.isabs(ref) and os.path.isfile(ref):
+            with open(ref, "rb") as fh:
+                return fh.read()
+        from open_webui.models.files import Files
+
+        rec = await _maybe_await(Files.get_file_by_id(ref))
+        if rec is not None:
+            return await _read_owui_file(rec)
+        if not ref.lower().endswith(TEMPLATE_EXTENSIONS):
+            return None
+        search = getattr(Files, "search_files", None)
+        if search is not None:  # v0.12+: newest first
+            found = await _maybe_await(search(filename=ref, limit=50))
+        else:
+            found = sorted(
+                (f for f in await _maybe_await(Files.get_files())
+                 if (f.filename or "").lower() == ref.lower()),
+                key=lambda f: f.created_at or 0,
+                reverse=True,
+            )
+        for rec in found:
+            if (rec.filename or "").lower() == ref.lower() and await _is_admin(rec.user_id):
+                return await _read_owui_file(rec)
+    except Exception:
+        return None
+    return None
+
+
+async def _export_action_default_template() -> str:
+    """The `default_template` set on the "Export to PowerPoint" action, so the
+    admin sets it once and the model is still told that template's layouts.
+    The action is recognised by its source (whatever id it was installed
+    under), not by name."""
+    try:
+        from open_webui.models.functions import Functions
+
+        actions = await _maybe_await(Functions.get_functions_by_type("action", active_only=True))
+        for fn in actions or []:
+            content = getattr(fn, "content", "") or ""
+            if "<!-- openppt -->" in content and "def build_pptx" in content:
+                valves = await _maybe_await(Functions.get_function_valves_by_id(fn.id)) or {}
+                return str(valves.get("default_template") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 class Filter:
     class Valves(BaseModel):
         enabled: bool = Field(
@@ -269,7 +377,7 @@ class Filter:
         )
         prime_without_template: bool = Field(
             default=True,
-            description="Also prime deck/presentation requests (and follow-up edits to a deck already in the chat) when no template is attached, using a template-less primer.",
+            description="Also prime deck/presentation requests (and follow-up edits to a deck already in the chat) when no template is attached: with the layouts of the default template set on the Export to PowerPoint action, or with the format alone if none is set.",
         )
         priority: int = Field(
             default=0, description="Filter execution priority (lower runs first)."
@@ -297,15 +405,19 @@ class Filter:
             data = await _maybe_await(
                 self._find_template_bytes(body, __chat_id__ or body.get("chat_id"))
             )
+            deck_turn = _looks_like_deck_request(messages) or _deck_in_progress(messages)
             if data is not None:
+                # A template attached to this chat: always about the deck.
                 layout_lines = _layouts_from_bytes(data)
                 if not layout_lines:
                     return body
                 content = _primer(layout_lines)
-            elif self.valves.prime_without_template and (
-                _looks_like_deck_request(messages) or _deck_in_progress(messages)
-            ):
-                content = _primer()
+            elif self.valves.prime_without_template and deck_turn:
+                # No attachment: the admin's default template (set on the
+                # export action) if there is one, else the format alone.
+                default = await _maybe_await(self._default_template_bytes())
+                layout_lines = _layouts_from_bytes(default) if default else []
+                content = _primer(layout_lines, attached=False)
             else:
                 return body
 
@@ -313,6 +425,9 @@ class Filter:
         except Exception:
             return body
         return body
+
+    async def _default_template_bytes(self):
+        return await _resolve_template_ref(await _export_action_default_template())
 
     async def _find_template_bytes(self, body: dict, chat_id: str = None):
         """Newest-first, return bytes of the first attached .pptx/.potx, or None.

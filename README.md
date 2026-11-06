@@ -33,7 +33,7 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 | Valve | Default | What it does |
 |-------|---------|--------------|
-| `default_template` | *(empty)* | A `.pptx`/`.potx` to use when nothing is attached to the chat: an absolute path on the Open WebUI server, or the id of a file uploaded to Open WebUI. Empty = the built-in theme. A template attached to the chat always wins. |
+| `default_template` | *(empty)* | The template every user's decks are built on: the **filename** of a `.pptx`/`.potx` an admin uploaded to Open WebUI (e.g. `brand.potx` — see [Default template for everyone](#default-template-for-everyone)). Also accepts an absolute server path or an Open WebUI file id. Empty = the built-in theme. A template attached to a chat wins for that chat. |
 | `accent_color` | `1F4E79` | Hex color of the built-in theme: title and section pages, titles, bullets, tables. Ignored when a template is used. |
 | `slide_numbers` | on | Number every slide except title and section pages, in the layout's own slide-number position. |
 | `auto_download` | on | Download the `.pptx` in the browser as soon as it's built. |
@@ -46,7 +46,7 @@ An "Export to PowerPoint" button now appears under every assistant message, and 
 
 ## Updating an existing install
 
-**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.8.0** afterwards (and **0.5.0** for the Template Primer filter).
+**Edit the function you already have — don't add a second one**, or you'll get two buttons. **Admin Panel → Functions** → pencil/**Edit** on *Export to PowerPoint* → select all, paste the current [`openppt_action.py`](openppt_action.py) → **Save**. Open WebUI reloads the module and refreshes its cache on save, so it's live immediately: no container restart, no re-enabling, no re-toggling per model, no settings to migrate. Confirm the version reads **0.8.1** afterwards (and **0.6.0** for the Template Primer filter).
 
 ## Outline format
 
@@ -148,7 +148,7 @@ With the [Filter](#the-workflow-template-in-deck-out) installed, attaching the t
 
 Names are matched case-insensitively (exact first, then a loose substring match), so `layout="two content"` finds **Two Content**. If no template is attached, or a name doesn't match, openPPT falls back to sensible defaults (a title-slide layout for the opening slide, a section layout for dividers, a two-column layout for `<column>` slides, a title-and-content layout for the rest) chosen by inspecting each layout's placeholders — so this works with any template, not just PowerPoint's built-in themes.
 
-**Which look a deck gets:** a template attached to the chat, else the admin's `default_template` Valve, else openPPT's built-in theme — 16:9, in the `accent_color` Valve's color, with accent title and section pages, dark left-aligned titles, and slide numbers. Text is sized to the box it lands in (large on sparse slides, smaller on dense ones) instead of overflowing, and placeholders left empty are removed so PowerPoint never shows "Click to add text".
+**Which look a deck gets:** a template attached to the chat, else the admin's [default template](#default-template-for-everyone), else openPPT's built-in theme — 16:9, in the `accent_color` Valve's color, with accent title and section pages, dark left-aligned titles, and slide numbers. Text is sized to the box it lands in (large on sparse slides, smaller on dense ones) instead of overflowing, and placeholders left empty are removed so PowerPoint never shows "Click to add text".
 
 Not sure what your template offers? `list_layouts()` returns every layout name (and its placeholder counts):
 
@@ -159,6 +159,27 @@ for name, ph in list_layouts(open("brand.potx", "rb").read()):
 ```
 
 Drop those names into your model's system prompt so it picks layouts that actually exist in your template. (The Filter does exactly this on your behalf whenever a template is attached — including one attached a few turns earlier — so you rarely need to.)
+
+## Default template for everyone
+
+To have every user's decks built on your company template, without anyone attaching it:
+
+1. **Upload the template as an admin.** Attach `brand.potx` (or `.pptx`) to any chat once, or add it to a Knowledge base. Open WebUI keeps the file. Only uploads by **admin** accounts count, so a user can't replace everyone's template by uploading a file with the same name.
+2. **Admin Panel → Functions →** gear icon on **Export to PowerPoint** → set `default_template` to the filename, `brand.potx`. Save.
+
+That's it. Both parts use the setting:
+
+- **Export:** any deck exported without an attached template is built on it.
+- **The Template Primer filter** reads the same setting from the Export action. So when any user asks for a deck, or edits one already in the chat, the model is told the template's layout names and picks one per slide (`layout="..."`), the same as when a template is attached. Other messages aren't touched.
+
+**To update the template**, upload the new version with the same filename. The newest admin upload wins. A template attached to a specific chat still overrides the default for that chat.
+
+`.potx` files work as well as `.pptx`. Before v0.8.1, a real `.potx` was rejected by python-pptx ("not a PowerPoint file").
+
+**If it isn't picked up:**
+- Exports still show the built-in theme, and the server log (`docker logs open-webui 2>&1 | grep openPPT`) says `default_template 'brand.potx': no such path, file id, or admin-uploaded file`. Check that the upload was made by an admin account, and that the filename matches exactly (case doesn't matter).
+- Admin Panel → Settings → Documents has an **Allowed File Extensions** list: if it's set, add `pptx` / `potx` to it, or the upload is refused.
+- Open WebUI may report that it couldn't extract text from the template. That doesn't matter; the file is still stored.
 
 ## No template? The Filter primes deck requests anyway
 
@@ -232,6 +253,12 @@ If the outline doesn't parse (no `<slide title="...">` elements found), it exits
 ```
 pip install python-pptx pydantic && python test_parser.py && python test_filter.py
 ```
+
+v0.8.1 makes a default template work for every user:
+
+- `default_template` can be the filename of a template an admin uploaded to Open WebUI. The newest admin upload with that name is used.
+- The Template Primer filter reads that setting from the Export action, so deck requests get the template's layout names without anything attached.
+- Real `.potx` files no longer fail with "not a PowerPoint file".
 
 v0.8.0 fixes the download that never appeared, and a round of deck quality:
 

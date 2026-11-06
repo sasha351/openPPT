@@ -270,6 +270,149 @@ def test_template_attached_turns_ago_is_found_in_the_saved_chat():
     assert "Section Header" in out["messages"][0]["content"]
 
 
+
+
+def _potx_bytes():
+    """A real .potx: a .pptx whose main part says 'template'."""
+    import zipfile
+
+    buf = io.BytesIO()
+    Presentation().save(buf)
+    src = zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as z:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"presentationml.presentation.main+xml", b"presentationml.template.main+xml"
+                )
+            z.writestr(item, data)
+    return out.getvalue()
+
+
+def _fake_owui_library(files, users, actions=()):
+    """Stand-in open_webui with async Files/Users/Functions as in v0.12.
+    files: [(id, filename, owner_id, path)] newest first; users: {id: role};
+    actions: [(id, source, valves)]. Returns an undo function."""
+    import sys
+    import types
+
+    class Rec:
+        def __init__(self, fid, name, owner, path):
+            self.id, self.filename, self.user_id, self.path = fid, name, owner, path
+            self.created_at = 0
+
+    recs = [Rec(*f) for f in files]
+
+    async def _v(value):
+        return value
+
+    class Files:
+        @staticmethod
+        def get_file_by_id(fid):
+            return _v(next((r for r in recs if r.id == fid), None))
+
+        @staticmethod
+        def search_files(user_id=None, filename="*", skip=0, limit=100):
+            return _v([r for r in recs if r.filename.lower() == filename.lower()][:limit])
+
+    class Storage:
+        @staticmethod
+        def get_file(path):
+            return path
+
+    class Users:
+        @staticmethod
+        def get_user_by_id(uid):
+            return _v(types.SimpleNamespace(id=uid, role=users[uid]) if uid in users else None)
+
+    class Functions:
+        @staticmethod
+        def get_functions_by_type(kind, active_only=False):
+            return _v([types.SimpleNamespace(id=i, content=c) for i, c, _ in actions] if kind == "action" else [])
+
+        @staticmethod
+        def get_function_valves_by_id(fid):
+            return _v(next((v for i, _, v in actions if i == fid), None))
+
+    class Chats:
+        @staticmethod
+        def get_chat_by_id(cid):
+            return _v(None)
+
+    mods = {name: types.ModuleType(name) for name in (
+        "open_webui", "open_webui.models", "open_webui.models.files", "open_webui.models.users",
+        "open_webui.models.functions", "open_webui.models.chats",
+        "open_webui.storage", "open_webui.storage.provider",
+    )}
+    mods["open_webui.models.files"].Files = Files
+    mods["open_webui.models.users"].Users = Users
+    mods["open_webui.models.functions"].Functions = Functions
+    mods["open_webui.models.chats"].Chats = Chats
+    mods["open_webui.storage.provider"].Storage = Storage
+    sys.modules.update(mods)
+    return lambda: [sys.modules.pop(k, None) for k in mods]
+
+
+def _write_tmp(data, suffix):
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        fh.write(data)
+    return fh.name
+
+
+OPENPPT_ACTION_SOURCE = 'APPENDIX_MARKER = "<!-- openppt -->"\ndef build_pptx(): ...'
+
+
+def test_deck_requests_get_the_default_template_layouts_from_the_export_action():
+    """The admin sets default_template once, on the export action; every
+    user's deck request must still be told that template's layout names."""
+    potx = _write_tmp(_potx_bytes(), ".potx")
+    undo = _fake_owui_library(
+        files=[("f1", "brand.potx", "u-admin", potx)],
+        users={"u-admin": "admin"},
+        actions=[
+            ("some_other_action", "def action(): ...", {"default_template": "nope.potx"}),
+            ("export_to_powerpoint", OPENPPT_ACTION_SOURCE, {"default_template": "brand.potx"}),
+        ],
+    )
+    try:
+        f = Filter()
+        out = _inlet(f, {"messages": [{"role": "user", "content": "make a deck from my notes"}]})
+        primer = out["messages"][0]["content"]
+        assert 'layout="' in primer and "Section Header" in primer
+        assert "organisation's PowerPoint template" in primer
+        # a message that isn't about a deck is left alone, template or not
+        chat = {"messages": [{"role": "user", "content": "what's the capital of France?"}]}
+        assert len(_inlet(f, chat)["messages"]) == 1
+        # a template attached to the chat still wins over the default
+        f2 = Filter()
+        f2._find_template_bytes = lambda body, chat_id=None: _default_template_bytes()
+        attached = _inlet(f2, {"messages": [{"role": "user", "content": "deck please"}]})
+        assert "The user attached a PowerPoint template" in attached["messages"][0]["content"]
+    finally:
+        undo()
+
+
+def test_no_default_template_means_the_plain_primer():
+    undo = _fake_owui_library(
+        files=[], users={}, actions=[("export_to_powerpoint", OPENPPT_ACTION_SOURCE, None)]
+    )
+    try:
+        out = _inlet(Filter(), {"messages": [{"role": "user", "content": "slides on Q3"}]})
+        primer = out["messages"][0]["content"]
+        assert SENTINEL in primer and 'layout="' not in primer
+    finally:
+        undo()
+
+
+def test_attached_potx_layouts_are_read():
+    lines = _layouts_from_bytes(_potx_bytes())
+    assert any("Section Header" in line for line in lines)
+
+
 if __name__ == "__main__":
     import inspect
 
