@@ -36,7 +36,11 @@ Hard rules:
 - Every other slide has 3-6 <li> bullets, each under ~12 words. Nest a <ul>
   inside an <li> for a sub-point. Push detail to <notes>.
 - <notes> is optional and goes after that slide's bullets.
-- Embed an image in place of a bullet: <img src="url-or-path" alt="description">
+- A later slide with no body (title, optional subtitle) is a section divider.
+- Side-by-side comparison (pros/cons, options, before/after): put each side
+  in <column heading="...">...</column>, each with its own <ul> of <li>.
+- <b>, <i> and <code> inside a bullet are kept as bold, italic, monospace.
+- Embed an image in place of a bullet: <img src="url" alt="description">
 - Tabular data goes in <table><tr><td>...</td></tr></table>, not bullets.
 - Commands or code go in <pre><code>...</code></pre> inside that slide; it
   renders as a monospace box on the slide.
@@ -44,6 +48,8 @@ Hard rules:
   be mistaken for markup — this matters most inside <pre><code>.
 - Never wrap the outline in a ```html fence, never write prose before or
   after it, never leave a <slide> unclosed.
+- If you think or reason before answering, the full outline still goes in
+  your final answer — anything left only in your reasoning is not exported.
 
 Content quality — the whole point of the deck:
 - Distill, don't transcribe. Pull the substance out of the source material;

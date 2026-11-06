@@ -1,9 +1,9 @@
 """
 title: Export to PowerPoint
 author: openPPT
-version: 0.7.3
+version: 0.8.0
 requirements: python-pptx
-description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a downloadable .pptx, with tables, code blocks, speaker notes, images, and custom templates. Attach a .pptx/.potx to the chat and the deck inherits its theme, fonts, and layouts — the model just dumps content as an outline and picks layouts by name. Works with any model (no tool calling needed).
+description: Adds an "Export to PowerPoint" button that converts an HTML outline in the assistant message into a .pptx that downloads straight away — with columns, tables, code blocks, speaker notes, images, bold/italic text, and slide numbers. Attach a .pptx/.potx to the chat (or set a default template in the Valves) and the deck inherits its theme, fonts, and layouts; otherwise it uses a built-in 16:9 theme in your accent color. Works with any model (no tool calling needed).
 """
 
 import asyncio
@@ -52,7 +52,7 @@ APPENDIX_MARKER = "<!-- openppt -->"
 
 # Kept equal to the docstring's 'version:' line — a stale paste in Open WebUI's
 # Functions list is otherwise invisible, and the diagnostic is where it shows.
-VERSION = "0.7.3"
+VERSION = "0.8.0"
 
 # How long the browser gets to start the auto-download before the export
 # carries on without it (the chip and the link still deliver the file).

@@ -1,2 +1,2 @@
 current issue:
-- after submitting a prompt and outline generated, clicking export to powerpoint, message saying download object generated but nothing actually appears
+- (fixed in v0.8.0) after the outline was generated, clicking Export to PowerPoint said the download was ready but nothing appeared. Open WebUI v0.10+ renders a reply from its structured `output`, and the link was appended to `content`. The deck now downloads in the browser, the link is written through the action's return value (synced into `output` on v0.12+), and the file chip renders on v0.10+. Verify on the live 0.12.3 install.
